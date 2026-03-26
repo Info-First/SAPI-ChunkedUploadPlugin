@@ -1,8 +1,6 @@
 # Chunked Upload ServiceAPI Plugin
 
-This project adds a custom Content Manager ServiceAPI plugin that supports resumable chunked uploads into an existing electronic record.
-
-It follows the same plugin pattern as the SDK sample ServiceAPI plugins, but reverses the partial-download approach into a session-based upload flow.
+This project adds a custom Content Manager ServiceAPI plugin that supports resumable chunked uploads to a new or existing electronic record.
 
 ## What it does
 
