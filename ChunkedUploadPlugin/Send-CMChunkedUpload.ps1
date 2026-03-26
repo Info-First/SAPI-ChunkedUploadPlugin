@@ -212,9 +212,3 @@ function Send-CmChunkedUpload {
 
     return $completeResponse
 }
-
-if (!$cred) {
-    $cred = Get-Credential -Message "Enter credentials for authentication (if required)"
-}
-
-Send-CmChunkedUpload -BaseUrl "http://cmwgs/cmserviceapi" -FilePath "C:\temp\upload-105mb.bin" -RecordTypeUri 4 -Credential $cred
