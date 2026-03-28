@@ -34,16 +34,16 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="ServiceStack">
-      <HintPath>..\..\..\..\references\TRIM ServiceAPI\25\ServiceStack.dll</HintPath>
+      <HintPath>C:\Program Files\Micro Focus\Content Manager\Web Client\bin\ServiceStack.dll</HintPath>
     </Reference>
     <Reference Include="ServiceStack.Client">
-      <HintPath>..\..\..\..\references\TRIM ServiceAPI\25\ServiceStack.Client.dll</HintPath>
+      <HintPath>C:\Program Files\Micro Focus\Content Manager\Web Client\bin\ServiceStack.Client.dll</HintPath>
     </Reference>
     <Reference Include="ServiceStack.Interfaces">
-      <HintPath>..\..\..\..\references\TRIM ServiceAPI\25\ServiceStack.Interfaces.dll</HintPath>
+      <HintPath>C:\Program Files\Micro Focus\Content Manager\Web Client\bin\ServiceStack.Interfaces.dll</HintPath>
     </Reference>
     <Reference Include="ServiceStack.Text">
-      <HintPath>..\..\..\..\references\TRIM ServiceAPI\25\ServiceStack.Text.dll</HintPath>
+      <HintPath>C:\Program Files\Micro Focus\Content Manager\Web Client\bin\ServiceStack.Text.dll</HintPath>
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Configuration" />
@@ -55,13 +55,13 @@
     <Reference Include="System.Xml" />
     <Reference Include="System.Xml.Linq" />
     <Reference Include="TRIM.SDK">
-      <HintPath>..\..\..\..\references\TRIM ServiceAPI\25\TRIM.SDK.dll</HintPath>
+      <HintPath>C:\Program Files\Micro Focus\Content Manager\Web Client\bin\TRIM.SDK.dll</HintPath>
     </Reference>
     <Reference Include="TRIMServiceAPICommon">
-      <HintPath>..\..\..\..\references\TRIM ServiceAPI\25\TRIMServiceAPICommon.dll</HintPath>
+      <HintPath>C:\Program Files\Micro Focus\Content Manager\Web Client\bin\TRIMServiceAPICommon.dll</HintPath>
     </Reference>
     <Reference Include="TRIMServiceAPIModel">
-      <HintPath>..\..\..\..\references\TRIM ServiceAPI\25\TRIMServiceAPIModel.dll</HintPath>
+      <HintPath>C:\Program Files\Micro Focus\Content Manager\Web Client\bin\TRIMServiceAPIModel.dll</HintPath>
     </Reference>
   </ItemGroup>
   <ItemGroup>
@@ -74,4 +74,11 @@
     <None Include="ReadMe.md" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <PropertyGroup>
+    <PostBuildEvent>
+      iisreset /stop
+      xcopy /Y "$(TargetPath)" "C:\Program Files\Micro Focus\Content Manager\Web Client\bin\"
+      iisreset /start
+    </PostBuildEvent>
+  </PropertyGroup>
 </Project>

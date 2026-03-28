@@ -48,7 +48,7 @@ namespace HP.HPTRIM.ServiceAPI
                 throw new ArgumentNullException(nameof(request));
             }
 
-            if (!request.RecordUri.HasValue || request.RecordUri.Value <= 0)
+            if (!request.StageOnly && (!request.RecordUri.HasValue || request.RecordUri.Value <= 0))
             {
                 throw HttpError.BadRequest("RecordUri is required.");
             }
@@ -61,7 +61,7 @@ namespace HP.HPTRIM.ServiceAPI
             var session = new UploadSessionState
             {
                 SessionId = Guid.NewGuid().ToString("N"),
-                RecordUri = request.RecordUri.Value,
+                RecordUri = request.RecordUri ?? 0,
                 FileName = Path.GetFileName(request.FileName),
                 ContentType = string.IsNullOrWhiteSpace(request.ContentType) ? MimeTypes.GetMimeType(request.FileName) : request.ContentType,
                 TotalBytes = request.TotalBytes,
@@ -72,7 +72,8 @@ namespace HP.HPTRIM.ServiceAPI
                 CreatedUtc = DateTime.UtcNow,
                 UpdatedUtc = DateTime.UtcNow,
                 ExpiresUtc = DateTime.UtcNow.AddHours(GetSessionExpiryHours()),
-                ChunkMap = new Dictionary<int, ChunkDescriptor>()
+                ChunkMap = new Dictionary<int, ChunkDescriptor>(),
+                StageOnly = request.StageOnly
             };
 
             SaveSession(session);
@@ -331,18 +332,10 @@ namespace HP.HPTRIM.ServiceAPI
             {
                 return configuredPath;
             }
-            // Prefer TrimApplication.TemporaryPath if available
-            // try
-            // {
-            //     string appTemp = TrimApplication.TemporaryPath;
-            //     if (!string.IsNullOrWhiteSpace(appTemp))
-            //     {
-            //         return Path.Combine(appTemp, "ChunkedUploadPlugin");
-            //     }
-            // }
-            // catch { /* fallback below */ }
-            // Last resort: system temp
-            return Path.Combine(Path.GetTempPath(), "ChunkedUploadPlugin");
+
+            // Centralized path in the ServiceAPI Workpath so permissions are consistent
+            // and it isn't dependent on volatile user temp profiles.
+            return @"D:\Micro Focus Content Manager\ServiceAPIWorkpath\ChunkedUploads";
         }
 
         private static int GetSessionExpiryHours()
@@ -409,6 +402,9 @@ namespace HP.HPTRIM.ServiceAPI
 
         [DataMember(Order = 13)]
         public Dictionary<int, ChunkDescriptor> ChunkMap { get; set; }
+
+        [DataMember(Order = 14)]
+        public bool StageOnly { get; set; }
     }
 
     [DataContract]

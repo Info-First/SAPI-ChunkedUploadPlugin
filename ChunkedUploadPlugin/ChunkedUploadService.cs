@@ -4,6 +4,7 @@ using HP.HPTRIM.ServiceModel;
 using TRIM.SDK;
 using ServiceStack;
 using System;
+using System.Configuration;
 using System.IO;
 using System.Linq;
 
@@ -16,8 +17,10 @@ namespace HP.HPTRIM.ServiceAPI
         public long? TotalSize { get; set; }
     }
     [Route("/UploadChunks/start", "POST")]
+    [Authenticate]
     public class StartChunkedUpload : IReturn<ChunkedUploadSessionResponse>
     {
+        public bool StageOnly { get; set; }
         public long? RecordUri { get; set; } // Optional: if not supplied, a new record will be created
         public long? RecordTypeUri { get; set; } // Required if creating new record
         public string Title { get; set; } // Required if creating new record
@@ -31,24 +34,28 @@ namespace HP.HPTRIM.ServiceAPI
     }
 
     [Route("/UploadChunks/{SessionId}", "GET")]
+    [Authenticate]
     public class GetChunkedUploadStatus : IReturn<ChunkedUploadStatusResponse>
     {
         public string SessionId { get; set; }
     }
 
     [Route("/UploadChunks/{SessionId}/missing", "GET")]
+    [Authenticate]
     public class GetMissingChunks : IReturn<GetMissingChunksResponse>
     {
         public string SessionId { get; set; }
     }
 
     [Route("/UploadChunks/{SessionId}/cancel", "POST")]
+    [Authenticate]
     public class CancelChunkedUpload : IReturn<CancelChunkedUploadResponse>
     {
         public string SessionId { get; set; }
     }
 
     [Route("/UploadChunks/{SessionId}/chunk/{ChunkNumber}", "POST,PUT")]
+    [Authenticate]
     public class UploadChunk : IReturn<UploadChunkResponse>
     {
         public string SessionId { get; set; }
@@ -63,12 +70,14 @@ namespace HP.HPTRIM.ServiceAPI
     }
 
     [Route("/UploadChunks/{SessionId}/complete", "POST")]
+    [Authenticate]
     public class CompleteChunkedUpload : IReturn<CompleteChunkedUploadResponse>
     {
         public string SessionId { get; set; }
     }
 
     [Route("/UploadChunks/{SessionId}", "DELETE")]
+    [Authenticate]
     public class AbortChunkedUpload : IReturn<AbortChunkedUploadResponse>
     {
         public string SessionId { get; set; }
@@ -146,6 +155,9 @@ namespace HP.HPTRIM.ServiceAPI
         public bool NewRevision { get; set; }
         public bool KeepCheckedOut { get; set; }
         public string AssembledSha256 { get; set; } // SHA256 of the assembled file
+        public string StagedFilePath { get; set; }
+        public string RecordFilePath { get; set; }
+        public string FullUploadedFileName { get; set; }
         public ResponseStatus ResponseStatus { get; set; }
     }
 
@@ -165,8 +177,8 @@ namespace HP.HPTRIM.ServiceAPI
 
         public object Post(StartChunkedUpload request)
         {
-            // If RecordUri is not supplied, create a new record
-            if ((!request.RecordUri.HasValue || request.RecordUri.Value <= 0))
+            // If RecordUri is not supplied and we are not in StageOnly mode, create a new record
+            if (!request.StageOnly && (!request.RecordUri.HasValue || request.RecordUri.Value <= 0))
             {
                 if (!request.RecordTypeUri.HasValue || string.IsNullOrWhiteSpace(request.Title))
                 {
@@ -186,9 +198,9 @@ namespace HP.HPTRIM.ServiceAPI
             return new ChunkedUploadSessionResponse
             {
                 SessionId = session.SessionId,
-                UploadChunkUrlTemplate = Request.GetAbsoluteUrl(string.Format("~/ChunkedUpload/{0}/chunk/{{chunkNumber}}", session.SessionId)),
-                CompleteUrl = Request.GetAbsoluteUrl(string.Format("~/ChunkedUpload/{0}/complete", session.SessionId)),
-                StatusUrl = Request.GetAbsoluteUrl(string.Format("~/ChunkedUpload/{0}", session.SessionId)),
+                UploadChunkUrlTemplate = Request.GetAbsoluteUrl(string.Format("~/UploadChunks/{0}/chunk/{{chunkNumber}}", session.SessionId)),
+                CompleteUrl = Request.GetAbsoluteUrl(string.Format("~/UploadChunks/{0}/complete", session.SessionId)),
+                StatusUrl = Request.GetAbsoluteUrl(string.Format("~/UploadChunks/{0}", session.SessionId)),
                 ExpiresUtc = session.ExpiresUtc,
                 ResponseStatus = new ResponseStatus()
             };
@@ -255,12 +267,52 @@ namespace HP.HPTRIM.ServiceAPI
             string assembledSha256 = null;
             try
             {
-                Logger.Info($"[CompleteChunkedUpload] SessionId={request.SessionId}, RecordUri={session.RecordUri}, FileName={session.FileName}");
+                Logger.Info($"[CompleteChunkedUpload] SessionId={request.SessionId}, RecordUri={session.RecordUri}, FileName={session.FileName}, StageOnly={session.StageOnly}");
                 var result = sessionStore.MaterializeFile(session);
                 var parts = result.Split('|');
                 assembledPath = parts[0];
                 assembledSha256 = parts.Length > 1 ? parts[1] : null;
                 Logger.Info($"[CompleteChunkedUpload] Assembled file path: {assembledPath}, SHA256: {assembledSha256}");
+
+                string trimHash = null;
+
+                if (session.StageOnly)
+                {
+                    try
+                    {
+                        trimHash = Database.CalculateDocumentHash(assembledPath);
+                        Logger.Info($"[CompleteChunkedUpload] TRIM SDK Calculated Hash for staging: {trimHash}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"[CompleteChunkedUpload] Failed to calculate TRIM hash: {ex.Message}");
+                    }
+
+                    string recordFilePath = null;
+                    string fullUploadedFileName = null;
+                    try
+                    {
+                        PrepareNativeUploadToken(assembledPath, session.FileName, out recordFilePath, out fullUploadedFileName);
+                        Logger.Info($"[CompleteChunkedUpload] Prepared native RecordFilePath token: {recordFilePath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"[CompleteChunkedUpload] Failed to prepare native upload token: {ex}");
+                    }
+
+                    return new CompleteChunkedUploadResponse
+                    {
+                        RecordUri = session.RecordUri,
+                        FileName = session.FileName,
+                        UploadedBytes = new FileInfo(assembledPath).Length,
+                        NewRevision = session.NewRevision,
+                        KeepCheckedOut = session.KeepCheckedOut,
+                        AssembledSha256 = trimHash ?? assembledSha256,
+                        StagedFilePath = assembledPath,
+                        RecordFilePath = recordFilePath,
+                        FullUploadedFileName = fullUploadedFileName
+                    };
+                }
 
                 var record = new TRIM.SDK.Record(Database, session.RecordUri);
                 Logger.Info($"[CompleteChunkedUpload] Loaded record: Uri={record.Uri}, Title={record.Title}, IsElectronic={record.IsElectronic}");
@@ -277,7 +329,6 @@ namespace HP.HPTRIM.ServiceAPI
                 Logger.Info($"[CompleteChunkedUpload] Created InputDocument for {session.FileName}");
 
                 string comments = string.IsNullOrWhiteSpace(session.Comments) ? "Uploaded via ChunkedUploadPlugin" : session.Comments;
-                string trimHash = null;
                 try
                 {
                     trimHash = Database.CalculateDocumentHash(assembledPath);
@@ -311,8 +362,66 @@ namespace HP.HPTRIM.ServiceAPI
             }
             finally
             {
-                sessionStore.DeleteSession(request.SessionId);
+                if (session != null && !session.StageOnly)
+                {
+                    sessionStore.DeleteSession(request.SessionId);
+                }
             }
+        }
+
+        private void PrepareNativeUploadToken(string assembledPath, string fileName, out string recordFilePath, out string fullUploadedFileName)
+        {
+            if (string.IsNullOrWhiteSpace(assembledPath) || !File.Exists(assembledPath))
+            {
+                throw new FileNotFoundException("Assembled file not found.", assembledPath);
+            }
+
+            var sanitizedFileName = Path.GetFileName(fileName);
+            if (string.IsNullOrWhiteSpace(sanitizedFileName))
+            {
+                sanitizedFileName = "uploaded.bin";
+            }
+
+            var userUri = ResolveCurrentUserUri();
+            var uploadBasePath = ResolveUploadBasePath();
+            var userFolderName = userUri.ToString();
+            var userUploadDirectory = Path.Combine(uploadBasePath, userFolderName);
+            Directory.CreateDirectory(userUploadDirectory);
+
+            var targetFilePath = Path.Combine(userUploadDirectory, sanitizedFileName);
+            File.Copy(assembledPath, targetFilePath, true);
+
+            recordFilePath = userFolderName + "\\" + sanitizedFileName;
+            fullUploadedFileName = targetFilePath;
+        }
+
+        private long ResolveCurrentUserUri()
+        {
+            try
+            {
+                var currentUser = Database.CurrentUser;
+                if (currentUser != null && currentUser.Uri > 0)
+                {
+                    return currentUser.Uri;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[CompleteChunkedUpload] Unable to resolve current user URI from Database.CurrentUser: {ex.Message}");
+            }
+
+            return 0;
+        }
+
+        private string ResolveUploadBasePath()
+        {
+            var configured = ConfigurationManager.AppSettings["ChunkedUpload.NativeUploadBasePath"];
+            if (!string.IsNullOrWhiteSpace(configured))
+            {
+                return configured;
+            }
+
+            return @"D:\Micro Focus Content Manager\ServiceAPIWorkpath\Uploads";
         }
 
         public object Delete(AbortChunkedUpload request)
@@ -339,7 +448,13 @@ namespace HP.HPTRIM.ServiceAPI
                 }
             }
 
-            var result = sessionStore.SaveChunk(session, request.ChunkNumber, offset, request.TotalBytes, Request.InputStream, request.Sha256);
+            Stream chunkStream = Request.InputStream;
+            if (Request.Files != null && Request.Files.Length > 0)
+            {
+                chunkStream = Request.Files[0].InputStream;
+            }
+
+            var result = sessionStore.SaveChunk(session, request.ChunkNumber, offset, request.TotalBytes, chunkStream, request.Sha256);
             return new UploadChunkResponse
             {
                 SessionId = session.SessionId,
