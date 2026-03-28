@@ -16,7 +16,7 @@ namespace HP.HPTRIM.ServiceAPI
         public long To { get; set; }
         public long? TotalSize { get; set; }
     }
-    [Route("/UploadChunks/start", "POST")]
+    [Route("/Upload/start", "POST")]
     [Authenticate]
     public class StartChunkedUpload : IReturn<ChunkedUploadSessionResponse>
     {
@@ -33,28 +33,28 @@ namespace HP.HPTRIM.ServiceAPI
         public string Comments { get; set; }
     }
 
-    [Route("/UploadChunks/{SessionId}", "GET")]
+    [Route("/Upload/{SessionId}", "GET")]
     [Authenticate]
     public class GetChunkedUploadStatus : IReturn<ChunkedUploadStatusResponse>
     {
         public string SessionId { get; set; }
     }
 
-    [Route("/UploadChunks/{SessionId}/missing", "GET")]
+    [Route("/Upload/{SessionId}/missing", "GET")]
     [Authenticate]
     public class GetMissingChunks : IReturn<GetMissingChunksResponse>
     {
         public string SessionId { get; set; }
     }
 
-    [Route("/UploadChunks/{SessionId}/cancel", "POST")]
+    [Route("/Upload/{SessionId}/cancel", "POST")]
     [Authenticate]
     public class CancelChunkedUpload : IReturn<CancelChunkedUploadResponse>
     {
         public string SessionId { get; set; }
     }
 
-    [Route("/UploadChunks/{SessionId}/chunk/{ChunkNumber}", "POST,PUT")]
+    [Route("/Upload/{SessionId}/chunk/{ChunkNumber}", "POST,PUT")]
     [Authenticate]
     public class UploadChunk : IReturn<UploadChunkResponse>
     {
@@ -69,18 +69,27 @@ namespace HP.HPTRIM.ServiceAPI
         public string Sha256 { get; set; }
     }
 
-    [Route("/UploadChunks/{SessionId}/complete", "POST")]
+    [Route("/Upload/{SessionId}/complete", "POST")]
     [Authenticate]
     public class CompleteChunkedUpload : IReturn<CompleteChunkedUploadResponse>
     {
         public string SessionId { get; set; }
     }
 
-    [Route("/UploadChunks/{SessionId}", "DELETE")]
+    [Route("/Upload/{SessionId}", "DELETE")]
     [Authenticate]
     public class AbortChunkedUpload : IReturn<AbortChunkedUploadResponse>
     {
         public string SessionId { get; set; }
+    }
+
+    [Route("/Upload/cleanup", "POST")]
+    [Authenticate]
+    public class CleanupChunkedUpload : IReturn<CleanupChunkedUploadResponse>
+    {
+        public string SessionId { get; set; }
+        public string StagedFilePath { get; set; }
+        public string FullUploadedFileName { get; set; }
     }
 
     public class ChunkedUploadSessionResponse : IHasResponseStatus
@@ -170,6 +179,15 @@ namespace HP.HPTRIM.ServiceAPI
         public ResponseStatus ResponseStatus { get; set; }
     }
 
+    public class CleanupChunkedUploadResponse : IHasResponseStatus
+    {
+        public string SessionId { get; set; }
+        public bool SessionDeleted { get; set; }
+        public bool StagedFileDeleted { get; set; }
+        public bool NativeUploadFileDeleted { get; set; }
+        public ResponseStatus ResponseStatus { get; set; }
+    }
+
     public class ChunkedUploadService : TrimServiceBase
     {
         private static readonly ServiceStack.Logging.ILog Logger = ServiceStack.Logging.LogManager.GetLogger(typeof(ChunkedUploadService));
@@ -198,9 +216,9 @@ namespace HP.HPTRIM.ServiceAPI
             return new ChunkedUploadSessionResponse
             {
                 SessionId = session.SessionId,
-                UploadChunkUrlTemplate = Request.GetAbsoluteUrl(string.Format("~/UploadChunks/{0}/chunk/{{chunkNumber}}", session.SessionId)),
-                CompleteUrl = Request.GetAbsoluteUrl(string.Format("~/UploadChunks/{0}/complete", session.SessionId)),
-                StatusUrl = Request.GetAbsoluteUrl(string.Format("~/UploadChunks/{0}", session.SessionId)),
+                UploadChunkUrlTemplate = Request.GetAbsoluteUrl(string.Format("~/Upload/{0}/chunk/{{chunkNumber}}", session.SessionId)),
+                CompleteUrl = Request.GetAbsoluteUrl(string.Format("~/Upload/{0}/complete", session.SessionId)),
+                StatusUrl = Request.GetAbsoluteUrl(string.Format("~/Upload/{0}", session.SessionId)),
                 ExpiresUtc = session.ExpiresUtc,
                 ResponseStatus = new ResponseStatus()
             };
@@ -434,6 +452,37 @@ namespace HP.HPTRIM.ServiceAPI
             };
         }
 
+        public object Post(CleanupChunkedUpload request)
+        {
+            bool sessionDeleted = false;
+            bool stagedDeleted = false;
+            bool nativeDeleted = false;
+
+            if (!string.IsNullOrWhiteSpace(request.SessionId))
+            {
+                try
+                {
+                    sessionStore.DeleteSession(request.SessionId);
+                    sessionDeleted = true;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"[CleanupChunkedUpload] Could not delete session {request.SessionId}: {ex.Message}");
+                }
+            }
+
+            stagedDeleted = DeleteIfUnderAllowedRoot(request.StagedFilePath, ResolveChunkRootPath(), "staged file");
+            nativeDeleted = DeleteIfUnderAllowedRoot(request.FullUploadedFileName, ResolveUploadBasePath(), "native upload file");
+
+            return new CleanupChunkedUploadResponse
+            {
+                SessionId = request.SessionId,
+                SessionDeleted = sessionDeleted,
+                StagedFileDeleted = stagedDeleted,
+                NativeUploadFileDeleted = nativeDeleted
+            };
+        }
+
         private UploadChunkResponse SaveChunk(UploadChunk request)
         {
             var session = sessionStore.GetRequiredSession(request.SessionId);
@@ -516,6 +565,52 @@ namespace HP.HPTRIM.ServiceAPI
                 total = totalVal;
             }
             return new ParsedContentRange { From = from, To = to, TotalSize = total };
+        }
+
+        private bool DeleteIfUnderAllowedRoot(string filePath, string allowedRoot, string label)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(allowedRoot))
+            {
+                return false;
+            }
+
+            try
+            {
+                var fullPath = Path.GetFullPath(filePath);
+                var fullAllowedRoot = Path.GetFullPath(allowedRoot)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                    + Path.DirectorySeparatorChar;
+
+                if (!fullPath.StartsWith(fullAllowedRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    Logger.Warn($"[CleanupChunkedUpload] Skip delete outside allowed root ({label}): {fullPath}");
+                    return false;
+                }
+
+                if (File.Exists(fullPath))
+                {
+                    File.Delete(fullPath);
+                    Logger.Info($"[CleanupChunkedUpload] Deleted {label}: {fullPath}");
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[CleanupChunkedUpload] Failed deleting {label}: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        private string ResolveChunkRootPath()
+        {
+            var configured = ConfigurationManager.AppSettings["ChunkedUpload.TempPath"];
+            if (!string.IsNullOrWhiteSpace(configured))
+            {
+                return configured;
+            }
+
+            return @"D:\Micro Focus Content Manager\ServiceAPIWorkpath\ChunkedUploads";
         }
     }
 }

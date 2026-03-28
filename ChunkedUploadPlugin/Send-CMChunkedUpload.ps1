@@ -72,7 +72,7 @@ function Send-CmChunkedUpload {
     Write-Host "[INFO] Starting chunked upload for $($fileInfo.Name) ($totalBytes bytes)"
     $invokeParams = @{
         Method = "Post"
-        Uri = "$BaseUrl/UploadChunks/start"
+        Uri = "$BaseUrl/Upload/start"
         Headers = $startHeaders
         ContentType = "application/json"
         Body = $startBody
@@ -93,7 +93,7 @@ function Send-CmChunkedUpload {
     try {
         $missingParams = @{
             Method = "Get"
-            Uri = "$BaseUrl/UploadChunks/$sessionId/missing"
+            Uri = "$BaseUrl/Upload/$sessionId/missing"
             Headers = $headers
         }
         if ($UseDefaultCredentials) {
@@ -125,7 +125,7 @@ function Send-CmChunkedUpload {
                 $chunkBytes = New-Object byte[] $read
                 [Array]::Copy($buffer, 0, $chunkBytes, 0, $read)
                 $to = $offset + $read - 1
-                $url = "$BaseUrl/UploadChunks/$sessionId/chunk/$chunkNumber"
+                $url = "$BaseUrl/Upload/$sessionId/chunk/$chunkNumber"
                 
                 $maxRetries = 3
                 $attempt = 0
@@ -174,7 +174,7 @@ function Send-CmChunkedUpload {
     Write-Host "[INFO] Completing upload session $sessionId..."
     $completeParams = @{
         Method = "Post"
-        Uri = "$BaseUrl/UploadChunks/$sessionId/complete"
+        Uri = "$BaseUrl/Upload/$sessionId/complete"
         Headers = $startHeaders
         ContentType = "application/json"
         Body = "{}"
