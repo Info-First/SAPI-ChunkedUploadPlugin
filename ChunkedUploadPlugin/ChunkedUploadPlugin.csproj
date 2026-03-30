@@ -81,4 +81,12 @@
       iisreset /start
     </PostBuildEvent>
   </PropertyGroup>
+  <PropertyGroup>
+    <WebClientChunkerPath>C:\Program Files\Micro Focus\Content Manager\Web Client\custom\chunker.js</WebClientChunkerPath>
+    <RepoChunkerPath>$(MSBuildProjectDirectory)\custom\chunker.js</RepoChunkerPath>
+  </PropertyGroup>
+  <Target Name="SyncChunkerFromWebClient" AfterTargets="Build" Condition="Exists('$(WebClientChunkerPath)')">
+    <Message Text="Syncing chunker.js from Web Client to repo: $(WebClientChunkerPath) -> $(RepoChunkerPath)" Importance="high" />
+    <Copy SourceFiles="$(WebClientChunkerPath)" DestinationFiles="$(RepoChunkerPath)" OverwriteReadOnlyFiles="true" />
+  </Target>
 </Project>
