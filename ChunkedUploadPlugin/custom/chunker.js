@@ -458,6 +458,88 @@ function isChunkedUploadCancelled(error) {
     return !!(error && (error.isChunkedUploadCancelled === true || error.name === 'AbortError'));
 }
 
+function resolveValueCandidate(source, keys) {
+    if (!source) return undefined;
+
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        if (!(key in source)) continue;
+        const raw = source[key];
+        try {
+            return (typeof raw === 'function') ? raw.call(source) : raw;
+        } catch (e) {
+            return raw;
+        }
+    }
+
+    return undefined;
+}
+
+function coerceBoolean(value, fallback) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true') return true;
+        if (normalized === 'false') return false;
+    }
+    return fallback;
+}
+
+function coerceString(value, fallback) {
+    if (value === undefined || value === null) return fallback;
+    return String(value);
+}
+
+function readCheckInOptionsFromModel(model) {
+    if (!model || typeof model !== 'object') return null;
+
+    const newRevision = resolveValueCandidate(model, ['makeNewRevision', 'newRevision', 'NewRevision']);
+    const keepCheckedOut = resolveValueCandidate(model, ['keepCheckedOut', 'keepBookedOut', 'KeepCheckedOut']);
+    const comments = resolveValueCandidate(model, ['comments', 'Comments']);
+
+    if (newRevision === undefined && keepCheckedOut === undefined && comments === undefined) {
+        return null;
+    }
+
+    return {
+        newRevision: coerceBoolean(newRevision, true),
+        keepCheckedOut: coerceBoolean(keepCheckedOut, false),
+        comments: coerceString(comments, '')
+    };
+}
+
+function resolveCheckInOptionsFromContext(sourceElement) {
+    // Defaults match current behavior when no Check In context is detected.
+    const defaults = {
+        newRevision: true,
+        keepCheckedOut: false,
+        comments: ''
+    };
+
+    if (typeof ko !== 'undefined' && sourceElement) {
+        let current = sourceElement;
+        let depth = 0;
+        while (current && depth < 16) {
+            const model = ko.dataFor(current);
+            const options = readCheckInOptionsFromModel(model);
+            if (options) {
+                return options;
+            }
+            current = current.parentElement;
+            depth++;
+        }
+    }
+
+    // Fallback to app-level Check In form when KO context chain does not expose options.
+    const rootCheckInForm = window.root && window.root.checkInForm;
+    const rootOptions = readCheckInOptionsFromModel(rootCheckInForm);
+    if (rootOptions) {
+        return rootOptions;
+    }
+
+    return defaults;
+}
+
 function cancelChunkedUploadState(state) {
     if (!state || state.cancelled) return;
 
@@ -612,7 +694,7 @@ function uploadChunkWithRetry(url, chunk, offset, totalBytes, cancellationState,
  * @param {number} recordUri - The target Record URI
  * @param {function} onProgress - Optional callback for progress updates
  */
-async function uploadFileInChunks(file, onProgress, cancellationState) {
+async function uploadFileInChunks(file, onProgress, cancellationState, checkInOptions) {
     const chunkSize = 4 * 1024 * 1024; // 4MB chunk size
     const expectedChunks = Math.ceil(file.size / chunkSize);
     
@@ -634,8 +716,10 @@ async function uploadFileInChunks(file, onProgress, cancellationState) {
             startFormData.append('ContentType', file.type || 'application/octet-stream');
             startFormData.append('TotalBytes', String(file.size));
             startFormData.append('ExpectedChunkCount', String(expectedChunks));
-            startFormData.append('NewRevision', 'true');
-            startFormData.append('KeepCheckedOut', 'false');
+            const startOptions = checkInOptions || { newRevision: true, keepCheckedOut: false, comments: '' };
+            startFormData.append('NewRevision', String(startOptions.newRevision === true));
+            startFormData.append('KeepCheckedOut', String(startOptions.keepCheckedOut === true));
+            startFormData.append('Comments', startOptions.comments || '');
 
             const startRes = await fetch(buildUploadRoute('start'), {
                 method: 'POST',
@@ -1027,6 +1111,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
     if (!file) return;
 
     const koViewModel = resolveUploadKoViewModel(contextElement);
+    const checkInOptions = resolveCheckInOptionsFromContext(contextElement);
     const cancellationState = {
         cancelled: false,
         sessionId: '',
@@ -1046,7 +1131,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
         const result = await uploadFileInChunks(file, function (percent) {
             const text = getChunkedUploadOverlayText();
             window._chunkedUploadOverlay.update(percent, text.uploadingFiles + ' ' + percent + '%');
-        }, cancellationState);
+        }, cancellationState, checkInOptions);
 
         logDebug('Chunked upload completed successfully! Staged file path:', result.StagedFilePath);
 
