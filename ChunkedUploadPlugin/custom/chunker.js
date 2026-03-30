@@ -3,7 +3,7 @@ const CHUNKED_UPLOAD_DEBUG_BANNER_ID = 'cm-chunked-upload-debug-banner';
 const SERVICE_API_BASE_URL = '/contentmanager/serviceapi';
 const JSON_ACCEPT_HEADERS = { 'Accept': 'application/json' };
 const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload').replace(/^\/+|\/+$/g, '');
-const CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT = 3;
+const CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT = 4;
 const CHUNKED_UPLOAD_MAX_CONCURRENT_STORAGE_KEY = 'cm_chunked_upload_max_concurrent';
 const CHUNKED_UPLOAD_RESUME_KEY_PREFIX = 'cm_upload_staged_';
 const CHUNKED_UPLOAD_RESUME_SWEEP_MARKER_KEY = 'cm_upload_staged_last_sweep_utc';
@@ -97,12 +97,12 @@ function getChunkedUploadDebugBanner() {
     banner.style.cssText = [
         'display:none',
         'position:fixed',
-        'top:0',
+        'bottom:0',
         'left:0',
         'right:0',
         'z-index:100000',
         'background:#fff4d6',
-        'border-bottom:1px solid #e0b252',
+        'border-top:1px solid #e0b252',
         'color:#553600',
         'font:600 12px/1.4 Segoe UI, Tahoma, sans-serif',
         'padding:10px 16px',
@@ -306,6 +306,7 @@ function getChunkedUploadOverlayText() {
     const uploadCancelledText = getChunkedUploadMessage('web_upload_cancelled', 'Upload cancelled');
     const uploadProgressText = getChunkedUploadMessage('web_upload_progress', 'Upload Progress');
     const uploadingFilesText = getChunkedUploadMessage('web_uploading_files', 'Uploading files');
+    const resumingUploadText = getChunkedUploadMessage('web_resuming_upload', 'Resuming upload');
 
     return {
         cancel: cancelText,
@@ -313,8 +314,15 @@ function getChunkedUploadOverlayText() {
         uploadComplete: uploadText + ' ' + completeText,
         uploadCancelled: uploadCancelledText,
         uploadProgress: uploadProgressText,
-        uploadingFiles: uploadingFilesText
+        uploadingFiles: uploadingFilesText,
+        resumingUpload: resumingUploadText
     };
+}
+
+function getChunkedUploadProgressMessage(percent, isResuming) {
+    const text = getChunkedUploadOverlayText();
+    const prefix = isResuming ? text.resumingUpload : text.uploadingFiles;
+    return prefix + ' ' + percent + '%';
 }
 
 logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
@@ -928,6 +936,7 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
         cancellationState.fileCacheKey = fileCacheKey;
     }
     let sessionId = localStorage.getItem(fileCacheKey);
+    let isResumingUpload = !!sessionId;
 
     try {
         // Step 1: Start or Resume the Session
@@ -983,6 +992,14 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
         const missingData = await missingRes.json();
         const missingChunks = missingData.MissingChunks || [];
         let uploadedCount = expectedChunks - missingChunks.length;
+
+        if (!isResumingUpload && uploadedCount > 0) {
+            isResumingUpload = true;
+        }
+
+        if (cancellationState) {
+            cancellationState.isResumingUpload = isResumingUpload;
+        }
 
         if (onProgress && expectedChunks > 0) {
             onProgress(Math.round((uploadedCount / expectedChunks) * 100));
@@ -1353,8 +1370,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
 
     try {
         const result = await uploadFileInChunks(file, function (percent) {
-            const text = getChunkedUploadOverlayText();
-            window._chunkedUploadOverlay.update(percent, text.uploadingFiles + ' ' + percent + '%');
+            window._chunkedUploadOverlay.update(percent, getChunkedUploadProgressMessage(percent, cancellationState.isResumingUpload === true));
         }, cancellationState, checkInOptions);
 
         logDebug('Chunked upload completed successfully! Staged file path:', result.StagedFilePath);
