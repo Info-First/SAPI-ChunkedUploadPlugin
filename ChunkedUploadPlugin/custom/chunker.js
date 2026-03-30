@@ -579,7 +579,17 @@ async function uploadFileInChunks(file, onProgress, cancellationState) {
             signal: cancellationState && cancellationState.abortController ? cancellationState.abortController.signal : undefined
         });
 
-        if (!completeRes.ok) throw new Error('Failed to complete upload');
+        if (!completeRes.ok) {
+            let detail = '';
+            try {
+                detail = (await completeRes.text() || '').trim();
+            } catch (e) {
+                detail = '';
+            }
+
+            const detailSuffix = detail ? ` | ${detail.slice(0, 300)}` : '';
+            throw new Error(`Failed to complete upload (HTTP ${completeRes.status})${detailSuffix}`);
+        }
 
         // Clean up local storage once fully successful
         localStorage.removeItem(fileCacheKey);

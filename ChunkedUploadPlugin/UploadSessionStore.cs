@@ -170,9 +170,30 @@ namespace HP.HPTRIM.ServiceAPI
                 throw HttpError.BadRequest("Chunk content is empty.");
             }
 
+            UploadSessionState sessionToSave = session;
             lock (SyncRoot)
             {
-                session.ChunkMap[chunkNumber] = new ChunkDescriptor
+                string manifestPath = GetManifestPath(session.SessionId);
+                if (File.Exists(manifestPath))
+                {
+                    using (var stream = File.OpenRead(manifestPath))
+                    {
+                        var serializer = new DataContractJsonSerializer(typeof(UploadSessionState));
+                        sessionToSave = (UploadSessionState)serializer.ReadObject(stream);
+                    }
+                }
+
+                if (sessionToSave.ChunkMap == null)
+                {
+                    sessionToSave.ChunkMap = new Dictionary<int, ChunkDescriptor>();
+                }
+
+                if (totalBytes > 0)
+                {
+                    sessionToSave.TotalBytes = totalBytes;
+                }
+
+                sessionToSave.ChunkMap[chunkNumber] = new ChunkDescriptor
                 {
                     ChunkNumber = chunkNumber,
                     Offset = offset,
@@ -182,16 +203,21 @@ namespace HP.HPTRIM.ServiceAPI
                     UploadedUtc = DateTime.UtcNow
                 };
 
-                session.UpdatedUtc = DateTime.UtcNow;
-                SaveSession(session);
+                sessionToSave.UpdatedUtc = DateTime.UtcNow;
+
+                using (var stream = File.Create(manifestPath))
+                {
+                    var serializer = new DataContractJsonSerializer(typeof(UploadSessionState));
+                    serializer.WriteObject(stream, sessionToSave);
+                }
             }
 
             return new UploadChunkWriteResult
             {
                 BytesWritten = bytesWritten,
                 CalculatedHash = calculatedHash,
-                TotalUploadedBytes = session.ChunkMap.Sum(item => item.Value.Length),
-                ChunkCount = session.ChunkMap.Count
+                TotalUploadedBytes = sessionToSave.ChunkMap.Sum(item => item.Value.Length),
+                ChunkCount = sessionToSave.ChunkMap.Count
             };
         }
 
