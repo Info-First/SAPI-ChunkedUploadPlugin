@@ -304,15 +304,31 @@ function getChunkedUploadOverlayText() {
     const uploadText = getChunkedUploadMessage('web_upload', 'Upload');
     const completeText = getChunkedUploadMessage('web_complete', 'Complete');
     const uploadCancelledText = getChunkedUploadMessage('web_upload_cancelled', 'Upload cancelled');
+    const uploadFailedText = getChunkedUploadMessage('web_upload_failed', 'Upload failed');
+    const uploadStartFailedText = getChunkedUploadMessage('web_upload_start_failed', 'Failed to start upload session');
+    const missingChunksFailedText = getChunkedUploadMessage('web_upload_missing_failed', 'Failed to query missing chunks');
+    const sessionExpiredText = getChunkedUploadMessage('web_session_may_have_expired', 'The session may have expired');
+    const completeFailedPrefixText = getChunkedUploadMessage('web_upload_complete_failed_prefix', 'Failed to complete upload (HTTP ');
+    const networkChunkErrorText = getChunkedUploadMessage('web_network_error_during_upload', 'Network error during chunk upload');
+    const httpStatusPrefixText = getChunkedUploadMessage('web_http_status_prefix', 'HTTP');
     const uploadProgressText = getChunkedUploadMessage('web_upload_progress', 'Upload Progress');
     const uploadingFilesText = getChunkedUploadMessage('web_uploading_files', 'Uploading files');
     const resumingUploadText = getChunkedUploadMessage('web_resuming_upload', 'Resuming upload');
+    const preparingText = getChunkedUploadMessage('web_preparing', 'Preparing');
 
     return {
         cancel: cancelText,
         cancelling: cancelText + '\u2026',
+        preparing: preparingText + '\u2026',
         uploadComplete: uploadText + ' ' + completeText,
         uploadCancelled: uploadCancelledText,
+        uploadFailedPrefix: uploadFailedText + ': ',
+        uploadStartFailed: uploadStartFailedText,
+        missingChunksFailed: missingChunksFailedText,
+        sessionMayHaveExpired: sessionExpiredText,
+        completeFailedPrefix: completeFailedPrefixText,
+        networkChunkError: networkChunkErrorText,
+        httpStatusPrefix: httpStatusPrefixText,
         uploadProgress: uploadProgressText,
         uploadingFiles: uploadingFilesText,
         resumingUpload: resumingUploadText
@@ -699,7 +715,7 @@ function getCsrfToken() {
 }
 
 function createChunkedUploadCancelledError() {
-    const error = new Error('Upload cancelled');
+    const error = new Error(getChunkedUploadOverlayText().uploadCancelled);
     error.isChunkedUploadCancelled = true;
     return error;
 }
@@ -879,7 +895,8 @@ function uploadChunkWithRetry(url, chunk, offset, totalBytes, cancellationState,
 
                 if (attempt >= maxRetries) {
                     console.error(`Max retries (${maxRetries}) reached for URL: ${url}`);
-                    reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}`));
+                    const text = getChunkedUploadOverlayText();
+                    reject(new Error(`${text.httpStatusPrefix} ${xhr.status}: ${xhr.statusText}`));
                     return;
                 }
 
@@ -908,7 +925,7 @@ function uploadChunkWithRetry(url, chunk, offset, totalBytes, cancellationState,
 
                 if (attempt >= maxRetries) {
                     console.error(`Max retries (${maxRetries}) reached for URL: ${url}`);
-                    reject(new Error('Network error during chunk upload'));
+                    reject(new Error(getChunkedUploadOverlayText().networkChunkError));
                     return;
                 }
 
@@ -980,7 +997,7 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
                 signal: cancellationState && cancellationState.abortController ? cancellationState.abortController.signal : undefined
             });
 
-            if (!startRes.ok) throw new Error('Failed to start upload session');
+            if (!startRes.ok) throw new Error(getChunkedUploadOverlayText().uploadStartFailed);
             const startData = await startRes.json();
 
             sessionId = startData.SessionId;
@@ -1004,7 +1021,8 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
 
         if (!missingRes.ok) {
             localStorage.removeItem(fileCacheKey);
-            throw new Error('Failed to query missing chunks. The session may have expired.');
+            const text = getChunkedUploadOverlayText();
+            throw new Error(`${text.missingChunksFailed}. ${text.sessionMayHaveExpired}.`);
         }
 
         const missingData = await missingRes.json();
@@ -1118,7 +1136,8 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
             }
 
             const detailSuffix = detail ? ` | ${detail.slice(0, 300)}` : '';
-            throw new Error(`Failed to complete upload (HTTP ${completeRes.status})${detailSuffix}`);
+            const text = getChunkedUploadOverlayText();
+            throw new Error(`${text.completeFailedPrefix}${completeRes.status})${detailSuffix}`);
         }
 
         // Clean up local storage once fully successful
@@ -1195,7 +1214,7 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
                 'font-size:13px;',
                 'color:#333;',
                 'margin-bottom:20px;',
-            '">Preparing\u2026</div>',
+            '"></div>',
             '<div style="display:flex;justify-content:center;">',
             '<button id="cm-cup-cancel" type="button" class="btn btn-flat btn-secondary" style="min-width:140px;">Cancel</button>',
             '</div>',
@@ -1213,7 +1232,7 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
             const cancelButton = overlay.querySelector('#cm-cup-cancel');
             overlay.querySelector('#cm-cup-filename').textContent = fileName || '';
             overlay.querySelector('#cm-cup-bar').style.width = '0%';
-            overlay.querySelector('#cm-cup-label').textContent = text.uploadProgress;
+            overlay.querySelector('#cm-cup-label').textContent = text.preparing;
             if (cancelButton) {
                 cancelButton.disabled = false;
                 cancelButton.textContent = text.cancel;
@@ -1349,7 +1368,7 @@ function applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUpl
     }
 
     if (typeof koViewModel.statusMessage === 'function') {
-        koViewModel.statusMessage('Upload complete');
+        koViewModel.statusMessage(getChunkedUploadOverlayText().uploadComplete);
     }
 
     if (typeof koViewModel.uploadProgress === 'function') {
@@ -1474,7 +1493,8 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
 
         console.error('Chunked upload failed:', error);
         window._chunkedUploadOverlay.disableCancel();
-        window._chunkedUploadOverlay.update(0, 'Upload Failed: ' + error.message);
+        const text = getChunkedUploadOverlayText();
+        window._chunkedUploadOverlay.update(0, text.uploadFailedPrefix + error.message);
         // Leave the overlay visible on error so the user can read the message,
         // then auto-dismiss after 4 seconds.
         setTimeout(function () { window._chunkedUploadOverlay.hide(); }, 4000);
