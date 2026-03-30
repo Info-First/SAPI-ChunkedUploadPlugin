@@ -106,6 +106,87 @@ logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
 // ---------------------------------------------------------------------------
 const _chunkedUploadPendingOps = {};
 const _chunkedUploadPendingByOriginalFile = {};
+const _chunkedUploadPendingDeleteConfirmation = {
+    originalFileNames: [],
+    clearTimer: null,
+    setAtUtc: 0
+};
+
+function clearPendingChunkedUploadDeleteConfirmation() {
+    if (_chunkedUploadPendingDeleteConfirmation.clearTimer) {
+        clearTimeout(_chunkedUploadPendingDeleteConfirmation.clearTimer);
+        _chunkedUploadPendingDeleteConfirmation.clearTimer = null;
+    }
+    _chunkedUploadPendingDeleteConfirmation.originalFileNames = [];
+    _chunkedUploadPendingDeleteConfirmation.setAtUtc = 0;
+}
+
+function setPendingChunkedUploadDeleteConfirmation(originalFileNames) {
+    clearPendingChunkedUploadDeleteConfirmation();
+    const uniqueNames = [];
+    (originalFileNames || []).forEach(function (name) {
+        const normalized = String(name || '').trim();
+        if (!normalized) return;
+        if (uniqueNames.indexOf(normalized) === -1) {
+            uniqueNames.push(normalized);
+        }
+    });
+    _chunkedUploadPendingDeleteConfirmation.originalFileNames = uniqueNames;
+    _chunkedUploadPendingDeleteConfirmation.setAtUtc = Date.now();
+    _chunkedUploadPendingDeleteConfirmation.clearTimer = setTimeout(function () {
+        clearPendingChunkedUploadDeleteConfirmation();
+    }, 15000);
+}
+
+function consumePendingChunkedUploadDeleteConfirmation() {
+    const originalFileNames = _chunkedUploadPendingDeleteConfirmation.originalFileNames.slice();
+    clearPendingChunkedUploadDeleteConfirmation();
+    return originalFileNames;
+}
+
+function extractOriginalFileName(raw) {
+    if (raw === undefined || raw === null) return '';
+    return String(raw).replace(/(^"|"$)/g, '').trim();
+}
+
+function resolveOriginalFileNamesFromDeleteAction(deleteLink, directItem) {
+    const names = [];
+
+    const directName = extractOriginalFileName(directItem && directItem.OriginalFileName !== undefined
+        ? (typeof directItem.OriginalFileName === 'function' ? directItem.OriginalFileName() : directItem.OriginalFileName)
+        : '');
+    if (directName) {
+        names.push(directName);
+        return names;
+    }
+
+    if (typeof ko === 'undefined' || !ko.dataFor) {
+        return names;
+    }
+
+    let current = deleteLink;
+    let depth = 0;
+    while (current && depth < 12) {
+        const vm = ko.dataFor(current);
+        if (vm && typeof vm.selections === 'function') {
+            const selected = vm.selections() || [];
+            selected.forEach(function (fileItem) {
+                const name = extractOriginalFileName(fileItem && fileItem.OriginalFileName);
+                if (name && names.indexOf(name) === -1) {
+                    names.push(name);
+                }
+            });
+
+            if (names.length > 0) {
+                return names;
+            }
+        }
+        current = current.parentElement;
+        depth++;
+    }
+
+    return names;
+}
 
 function normalizeOriginalFileName(value) {
     if (value === undefined || value === null) return '';
@@ -903,25 +984,43 @@ const handleChunkedUploadDeleteClick = function (event) {
 
     if (!deleteLink) return;
 
-    let originalFileName = '';
+    let item = null;
     try {
         if (typeof ko !== 'undefined' && ko.dataFor) {
             const deleteRow = deleteLink.closest('li') || deleteLink.parentElement;
-            const item = ko.dataFor(deleteLink) || ko.dataFor(deleteRow);
-            if (item) {
-                if (typeof item.OriginalFileName === 'function') {
-                    originalFileName = item.OriginalFileName();
-                } else {
-                    originalFileName = item.OriginalFileName;
-                }
-            }
+            item = ko.dataFor(deleteLink) || ko.dataFor(deleteRow);
         }
     } catch (e) {
         logDebug('Could not resolve delete-click KO context:', e);
     }
 
-    if (!originalFileName) return;
-    void abortChunkedUploadSessionForOriginalFile(originalFileName);
+    const originalFileNames = resolveOriginalFileNamesFromDeleteAction(deleteLink, item);
+    if (!originalFileNames.length) return;
+    setPendingChunkedUploadDeleteConfirmation(originalFileNames);
+};
+
+const handleChunkedUploadDeleteConfirmOkClick = function (event) {
+    const okButton = event && event.target && event.target.closest
+        ? event.target.closest('button#okBtn')
+        : null;
+
+    if (!okButton) return;
+
+    const originalFileNames = consumePendingChunkedUploadDeleteConfirmation();
+    if (!originalFileNames.length) return;
+
+    originalFileNames.forEach(function (name) {
+        void abortChunkedUploadSessionForOriginalFile(name);
+    });
+};
+
+const handleChunkedUploadDeleteConfirmCancelClick = function (event) {
+    const cancelButton = event && event.target && event.target.closest
+        ? event.target.closest('button#cancelBtn, button[data-bind*="cancelHandler"]')
+        : null;
+
+    if (!cancelButton) return;
+    clearPendingChunkedUploadDeleteConfirmation();
 };
 
 async function processChunkedUploadFile(file, contextElement, clearInputElement) {
@@ -1048,5 +1147,7 @@ if (window.__chunkedUploadDropHandlerInstalled !== true) {
 
 if (window.__chunkedUploadDeleteHandlerInstalled !== true) {
     document.addEventListener('click', handleChunkedUploadDeleteClick, true);
+    document.addEventListener('click', handleChunkedUploadDeleteConfirmOkClick, true);
+    document.addEventListener('click', handleChunkedUploadDeleteConfirmCancelClick, true);
     window.__chunkedUploadDeleteHandlerInstalled = true;
 }
