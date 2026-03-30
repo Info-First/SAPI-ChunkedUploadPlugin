@@ -527,6 +527,24 @@ async function cleanupChunkedUpload(pending) {
     }
 }
 
+async function abortChunkedUploadSessionById(sessionId) {
+    if (!sessionId) return;
+
+    try {
+        const res = await fetch(buildUploadRoute(sessionId), {
+            method: 'DELETE',
+            credentials: 'include',
+            headers: JSON_ACCEPT_HEADERS
+        });
+
+        if (!res.ok) {
+            logDebug(`Abort session call failed for ${sessionId} (HTTP ${res.status}).`);
+        }
+    } catch (e) {
+        logDebug('Abort session call failed:', e);
+    }
+}
+
 (function installSaveInterceptor() {
     if (window.__chunkedUploadSaveInterceptorInstalled === true) {
         return;
@@ -926,7 +944,7 @@ function uploadChunkWithRetry(url, chunk, offset, totalBytes, cancellationState,
  * @param {number} recordUri - The target Record URI
  * @param {function} onProgress - Optional callback for progress updates
  */
-async function uploadFileInChunks(file, onProgress, cancellationState, checkInOptions) {
+async function uploadFileInChunks(file, onProgress, cancellationState, checkInOptions, hasRetriedAfterContiguousError) {
     const chunkSize = 4 * 1024 * 1024; // 4MB chunk size
     const expectedChunks = Math.ceil(file.size / chunkSize);
     
@@ -991,7 +1009,33 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
 
         const missingData = await missingRes.json();
         const missingChunks = missingData.MissingChunks || [];
-        let uploadedCount = expectedChunks - missingChunks.length;
+        const maxConcurrentUploads = resolveChunkedUploadConcurrency();
+        const selectedChunkSet = new Set(missingChunks);
+        const chunksToUpload = missingChunks.slice();
+
+        // On resumed sessions, re-upload a small tail window of already-uploaded
+        // chunks to heal any partial chunk writes caused by page refresh/interrupt.
+        if (isResumingUpload && expectedChunks > 0 && missingChunks.length < expectedChunks) {
+            const uploadedChunks = [];
+            for (let chunkNumber = 0; chunkNumber < expectedChunks; chunkNumber++) {
+                if (!selectedChunkSet.has(chunkNumber)) {
+                    uploadedChunks.push(chunkNumber);
+                }
+            }
+
+            const safetyReuploadCount = Math.min(maxConcurrentUploads, uploadedChunks.length);
+            for (let i = uploadedChunks.length - safetyReuploadCount; i < uploadedChunks.length; i++) {
+                const chunkNumber = uploadedChunks[i];
+                if (!selectedChunkSet.has(chunkNumber)) {
+                    chunksToUpload.push(chunkNumber);
+                    selectedChunkSet.add(chunkNumber);
+                }
+            }
+
+            chunksToUpload.sort(function (a, b) { return a - b; });
+        }
+
+        let uploadedCount = expectedChunks - chunksToUpload.length;
 
         if (!isResumingUpload && uploadedCount > 0) {
             isResumingUpload = true;
@@ -1005,17 +1049,15 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
             onProgress(Math.round((uploadedCount / expectedChunks) * 100));
         }
 
-        // Loop ONLY over the missing chunks
-        // Upload missing chunks in parallel batches (configurable concurrency, default 3)
-        const maxConcurrentUploads = resolveChunkedUploadConcurrency();
+        // Upload selected chunks in parallel batches (missing + resume safety window)
 
-        for (let i = 0; i < missingChunks.length; i += maxConcurrentUploads) {
+        for (let i = 0; i < chunksToUpload.length; i += maxConcurrentUploads) {
             if (cancellationState && cancellationState.cancelled) {
                 throw createChunkedUploadCancelledError();
             }
 
             // Build a batch of up to maxConcurrentUploads chunks
-            const batch = missingChunks.slice(i, i + maxConcurrentUploads);
+            const batch = chunksToUpload.slice(i, i + maxConcurrentUploads);
             const batchPromises = batch.map(async (chunkNumber) => {
                 const offset = chunkNumber * chunkSize;
                 const chunk = file.slice(offset, offset + chunkSize);
@@ -1057,6 +1099,22 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
                 detail = (await completeRes.text() || '').trim();
             } catch (e) {
                 detail = '';
+            }
+
+            const detailLower = detail.toLowerCase();
+            if (completeRes.status === 400 && detailLower.indexOf('uploaded chunks are not contiguous') >= 0) {
+                // Resume metadata can be corrupted after interrupted requests.
+                // Drop cached session so the next attempt starts from a clean session.
+                localStorage.removeItem(fileCacheKey);
+                await abortChunkedUploadSessionById(sessionId);
+
+                if (hasRetriedAfterContiguousError !== true && !(cancellationState && cancellationState.cancelled)) {
+                    logDebug('Detected non-contiguous upload session; retrying once with a fresh session.');
+                    if (onProgress) {
+                        onProgress(0);
+                    }
+                    return await uploadFileInChunks(file, onProgress, cancellationState, checkInOptions, true);
+                }
             }
 
             const detailSuffix = detail ? ` | ${detail.slice(0, 300)}` : '';

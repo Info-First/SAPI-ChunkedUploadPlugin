@@ -8,6 +8,7 @@ using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 
 namespace HP.HPTRIM.ServiceAPI
 {
@@ -26,12 +27,7 @@ namespace HP.HPTRIM.ServiceAPI
         {
             ValidateSessionId(sessionId);
             string dir = GetSessionDirectory(sessionId);
-            if (Directory.Exists(dir))
-            {
-                Directory.Delete(dir, true);
-                return true;
-            }
-            return false;
+            return TryDeleteDirectory(dir, 5, 75);
         }
         private readonly string rootPath;
 
@@ -280,10 +276,55 @@ namespace HP.HPTRIM.ServiceAPI
             ValidateSessionId(sessionId);
 
             string sessionDirectory = GetSessionDirectory(sessionId);
-            if (Directory.Exists(sessionDirectory))
+            if (!TryDeleteDirectory(sessionDirectory, 5, 75) && Directory.Exists(sessionDirectory))
             {
-                Directory.Delete(sessionDirectory, true);
+                throw new IOException(string.Format("Failed to delete upload session directory '{0}'.", sessionDirectory));
             }
+        }
+
+        private static bool TryDeleteDirectory(string directoryPath, int attempts, int delayMs)
+        {
+            if (!Directory.Exists(directoryPath))
+            {
+                return false;
+            }
+
+            var maxAttempts = Math.Max(1, attempts);
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    lock (SyncRoot)
+                    {
+                        if (!Directory.Exists(directoryPath))
+                        {
+                            return true;
+                        }
+
+                        Directory.Delete(directoryPath, true);
+                    }
+
+                    return true;
+                }
+                catch (IOException)
+                {
+                    if (attempt == maxAttempts)
+                    {
+                        return false;
+                    }
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    if (attempt == maxAttempts)
+                    {
+                        return false;
+                    }
+                }
+
+                Thread.Sleep(Math.Max(0, delayMs));
+            }
+
+            return false;
         }
 
         private void SaveSession(UploadSessionState session)
