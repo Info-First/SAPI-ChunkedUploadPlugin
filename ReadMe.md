@@ -85,6 +85,10 @@ Use this when ServiceAPI is hosted by Content Manager Web Client.
 6. Recycle app pool or restart the Web Client site.
 7. Hard refresh browser (Ctrl+F5).
 
+**Important deployment note:**
+
+The active runtime script is the Web Client file copy at `C:\Program Files\Micro Focus\Content Manager\Web Client\custom\chunker.js`, not the repo source. This is the file the browser loads and executes. Changes to the repo source will not take effect until you copy the updated file into the Web Client custom folder and the browser refreshes. For development/testing, keep both in sync; for production, only the deployed Web Client copy matters.
+
 Web Client script notes:
 
 - Script currently targets ServiceAPI base path `/contentmanager/serviceapi`.
@@ -139,6 +143,17 @@ Standalone deployment:
 - Native upload copy path resolves under `ChunkedUpload.NativeUploadBasePath`.
 - `cleanup` removes session/temp artifacts as expected.
 
+## Supported upload entry points
+
+The chunked upload integration works with any CM action that uses the standard file upload widget (TRIMFileUpload or files[] input):
+
+- **New Record** — create a new record with an electronic document attached
+- **Check In** — attach an electronic object to an existing metadata-only record or create a new revision
+- **MainObjectUpdateTaskForm-based tasks** — any workflow or custom task that includes a file field
+- **Any custom form** using `files[]` input in the Web Client
+
+The integration intercepts file input changes and dropzone events globally via event capture, so all forms automatically benefit from chunked upload and cancellation support.
+
 ## Troubleshooting
 
 ### Hash verification empty value
@@ -155,6 +170,16 @@ This is valid. The script treats empty cleanup response body as success.
 ### Browser console errors from `chrome-extension://...`
 
 Errors referencing browser extensions (for example `recordingStatus`) are external to this plugin.
+
+### Upload works in New Record but not in other forms
+
+The chunked upload integration uses event capture on `files[]` inputs, which may conflict with form initialization order in some edge cases. If another form isn't triggering the upload:
+
+1. Open browser developer tools (F12) and check the Console tab.
+2. Set `window.CHUNKED_UPLOAD_VERBOSE = true` and reload to enable debug logging.
+3. Check that the file input has `name="files[]"` attribute.
+4. Verify the form is using the standard TRIMFileUpload widget.
+5. If still not working, file an issue with the form name and debug output.
 
 ## Recent changes
 
