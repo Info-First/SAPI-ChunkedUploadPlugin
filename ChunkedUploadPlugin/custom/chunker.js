@@ -4,6 +4,13 @@ const JSON_ACCEPT_HEADERS = { 'Accept': 'application/json' };
 const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload').replace(/^\/+|\/+$/g, '');
 const CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT = 3;
 const CHUNKED_UPLOAD_MAX_CONCURRENT_STORAGE_KEY = 'cm_chunked_upload_max_concurrent';
+const CHUNKED_UPLOAD_RESUME_KEY_PREFIX = 'cm_upload_staged_';
+const CHUNKED_UPLOAD_RESUME_SWEEP_MARKER_KEY = 'cm_upload_staged_last_sweep_utc';
+const CHUNKED_UPLOAD_RESUME_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const CHUNKED_UPLOAD_RESUME_SWEEP_MAX_KEYS = 25;
+const CHUNKED_UPLOAD_SESSION_ID_REGEX = /^[a-z0-9]{32}$/i;
+
+let _chunkedUploadResumeSweepPromise = null;
 
 function clampChunkedUploadConcurrency(value) {
     const parsed = parseInt(value, 10);
@@ -66,6 +73,100 @@ function buildUploadRoute(path) {
     return `${SERVICE_API_BASE_URL}/${CHUNKED_UPLOAD_ROUTE_ROOT}/${suffix}`;
 }
 
+function isValidChunkedUploadSessionId(value) {
+    return CHUNKED_UPLOAD_SESSION_ID_REGEX.test(String(value || '').trim());
+}
+
+function shouldRunChunkedUploadResumeSweep() {
+    try {
+        const lastSweepRaw = localStorage.getItem(CHUNKED_UPLOAD_RESUME_SWEEP_MARKER_KEY);
+        const lastSweep = parseInt(lastSweepRaw || '0', 10);
+        if (!Number.isFinite(lastSweep) || lastSweep <= 0) {
+            return true;
+        }
+
+        return (Date.now() - lastSweep) >= CHUNKED_UPLOAD_RESUME_SWEEP_INTERVAL_MS;
+    } catch (e) {
+        return false;
+    }
+}
+
+function markChunkedUploadResumeSweepRun() {
+    try {
+        localStorage.setItem(CHUNKED_UPLOAD_RESUME_SWEEP_MARKER_KEY, String(Date.now()));
+    } catch (e) {
+        // Ignore localStorage write issues.
+    }
+}
+
+function getChunkedUploadResumeKeys() {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || key.indexOf(CHUNKED_UPLOAD_RESUME_KEY_PREFIX) !== 0) continue;
+        keys.push(key);
+        if (keys.length >= CHUNKED_UPLOAD_RESUME_SWEEP_MAX_KEYS) break;
+    }
+    return keys;
+}
+
+async function cleanupStaleChunkedUploadResumeKeys() {
+    if (!shouldRunChunkedUploadResumeSweep()) {
+        return;
+    }
+
+    let resumeKeys = [];
+    try {
+        resumeKeys = getChunkedUploadResumeKeys();
+    } catch (e) {
+        return;
+    }
+
+    for (let i = 0; i < resumeKeys.length; i++) {
+        const key = resumeKeys[i];
+        let sessionId = '';
+        try {
+            sessionId = String(localStorage.getItem(key) || '').trim();
+        } catch (e) {
+            continue;
+        }
+
+        if (!sessionId || !isValidChunkedUploadSessionId(sessionId)) {
+            try { localStorage.removeItem(key); } catch (e) { }
+            continue;
+        }
+
+        try {
+            const res = await fetch(buildUploadRoute(sessionId), {
+                method: 'GET',
+                credentials: 'include',
+                headers: JSON_ACCEPT_HEADERS
+            });
+
+            // Remove keys only when the service confirms session is invalid/expired.
+            if (res.status === 404 || res.status === 410 || res.status === 400) {
+                try { localStorage.removeItem(key); } catch (e) { }
+            }
+        } catch (e) {
+            // Network/transient errors should not drop resume state.
+        }
+    }
+
+    markChunkedUploadResumeSweepRun();
+}
+
+function ensureChunkedUploadResumeSweep() {
+    if (_chunkedUploadResumeSweepPromise) {
+        return _chunkedUploadResumeSweepPromise;
+    }
+
+    _chunkedUploadResumeSweepPromise = cleanupStaleChunkedUploadResumeKeys().finally(function () {
+        _chunkedUploadResumeSweepPromise = null;
+    });
+
+    return _chunkedUploadResumeSweepPromise;
+}
+
 function getChunkedUploadMessage(key, fallback) {
     const value =
         (typeof HP !== 'undefined' && HP.HPTRIM && HP.HPTRIM.Messages)
@@ -96,6 +197,7 @@ function getChunkedUploadOverlayText() {
 }
 
 logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
+void ensureChunkedUploadResumeSweep();
 
 // ---------------------------------------------------------------------------
 // Post-save hash verification
