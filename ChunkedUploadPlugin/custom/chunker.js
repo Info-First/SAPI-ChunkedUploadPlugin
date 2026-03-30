@@ -105,6 +105,72 @@ logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
 // new record URI, then queries DocumentHash via ServiceAPI and compares.
 // ---------------------------------------------------------------------------
 const _chunkedUploadPendingOps = {};
+const _chunkedUploadPendingByOriginalFile = {};
+
+function normalizeOriginalFileName(value) {
+    if (value === undefined || value === null) return '';
+    let normalized = String(value).trim();
+    if ((normalized.startsWith('"') && normalized.endsWith('"')) || (normalized.startsWith("'") && normalized.endsWith("'"))) {
+        normalized = normalized.slice(1, -1);
+    }
+    return normalized.toLowerCase();
+}
+
+function registerPendingUpload(uploadedFileName, pending, originalFileName) {
+    if (!uploadedFileName || !pending) return;
+    _chunkedUploadPendingOps[uploadedFileName] = pending;
+
+    const originalKey = normalizeOriginalFileName(originalFileName);
+    if (originalKey) {
+        _chunkedUploadPendingByOriginalFile[originalKey] = uploadedFileName;
+    }
+}
+
+function unregisterPendingUpload(uploadedFileName, pending) {
+    if (uploadedFileName && _chunkedUploadPendingOps[uploadedFileName]) {
+        delete _chunkedUploadPendingOps[uploadedFileName];
+    }
+
+    const originalKey = normalizeOriginalFileName(pending && pending.originalFileName);
+    if (originalKey && _chunkedUploadPendingByOriginalFile[originalKey] === uploadedFileName) {
+        delete _chunkedUploadPendingByOriginalFile[originalKey];
+    }
+}
+
+async function abortChunkedUploadSessionForOriginalFile(originalFileName) {
+    const originalKey = normalizeOriginalFileName(originalFileName);
+    if (!originalKey) return;
+
+    const uploadedFileName = _chunkedUploadPendingByOriginalFile[originalKey];
+    if (!uploadedFileName) return;
+
+    const pending = _chunkedUploadPendingOps[uploadedFileName];
+    if (!pending || !pending.sessionId) {
+        unregisterPendingUpload(uploadedFileName, pending || { originalFileName: originalFileName });
+        return;
+    }
+
+    try {
+        const res = await fetch(buildUploadRoute(pending.sessionId), {
+            method: 'DELETE',
+            credentials: 'include',
+            headers: JSON_ACCEPT_HEADERS
+        });
+
+        if (!res.ok) {
+            logDebug(`Delete session call failed for ${pending.sessionId} (HTTP ${res.status}).`);
+        } else {
+            logDebug(`Deleted chunked upload session ${pending.sessionId} for file ${originalFileName}.`);
+        }
+    } catch (e) {
+        logDebug('Delete session call failed:', e);
+    } finally {
+        if (pending.fileCacheKey) {
+            localStorage.removeItem(pending.fileCacheKey);
+        }
+        unregisterPendingUpload(uploadedFileName, pending);
+    }
+}
 
 async function cleanupChunkedUpload(pending) {
     try {
@@ -204,7 +270,7 @@ async function cleanupChunkedUpload(pending) {
 
                         if (!pending) return;
 
-                        delete _chunkedUploadPendingOps[matchedKey];
+                        unregisterPendingUpload(matchedKey, pending);
 
                         if (pending.expectedHash) {
                             await verifyDocumentHash(uri, pending.expectedHash);
@@ -830,6 +896,34 @@ function applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUpl
     return true;
 }
 
+const handleChunkedUploadDeleteClick = function (event) {
+    const deleteLink = event && event.target && event.target.closest
+        ? event.target.closest('a[data-bind*="onDeleteFileAction"]')
+        : null;
+
+    if (!deleteLink) return;
+
+    let originalFileName = '';
+    try {
+        if (typeof ko !== 'undefined' && ko.dataFor) {
+            const deleteRow = deleteLink.closest('li') || deleteLink.parentElement;
+            const item = ko.dataFor(deleteLink) || ko.dataFor(deleteRow);
+            if (item) {
+                if (typeof item.OriginalFileName === 'function') {
+                    originalFileName = item.OriginalFileName();
+                } else {
+                    originalFileName = item.OriginalFileName;
+                }
+            }
+        }
+    } catch (e) {
+        logDebug('Could not resolve delete-click KO context:', e);
+    }
+
+    if (!originalFileName) return;
+    void abortChunkedUploadSessionForOriginalFile(originalFileName);
+};
+
 async function processChunkedUploadFile(file, contextElement, clearInputElement) {
     if (!file) return;
 
@@ -862,12 +956,14 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
 
         // Register post-save verification + cleanup metadata.
         if (uploadedFileName) {
-            _chunkedUploadPendingOps[uploadedFileName] = {
+            registerPendingUpload(uploadedFileName, {
                 expectedHash: result.AssembledSha256 || '',
                 sessionId: result.SessionId || '',
                 stagedFilePath: result.StagedFilePath || '',
-                fullUploadedFileName: result.FullUploadedFileName || ''
-            };
+                fullUploadedFileName: result.FullUploadedFileName || '',
+                fileCacheKey: cancellationState.fileCacheKey || '',
+                originalFileName: file.name
+            }, file.name);
             logDebug('Registered pending post-save operations for:', uploadedFileName);
         }
 
@@ -948,4 +1044,9 @@ if (window.__chunkedUploadDropHandlerInstalled !== true) {
     document.addEventListener('dragover', handleChunkedUploadDragOver, true);
     document.addEventListener('drop', handleChunkedUploadDrop, true);
     window.__chunkedUploadDropHandlerInstalled = true;
+}
+
+if (window.__chunkedUploadDeleteHandlerInstalled !== true) {
+    document.addEventListener('click', handleChunkedUploadDeleteClick, true);
+    window.__chunkedUploadDeleteHandlerInstalled = true;
 }
