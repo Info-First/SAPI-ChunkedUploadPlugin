@@ -1,4 +1,5 @@
-const CHUNKED_UPLOAD_VERBOSE = (window.CHUNKED_UPLOAD_VERBOSE === true);
+const CHUNKED_UPLOAD_VERBOSE_STORAGE_KEY = 'cm_chunked_upload_verbose';
+const CHUNKED_UPLOAD_DEBUG_BANNER_ID = 'cm-chunked-upload-debug-banner';
 const SERVICE_API_BASE_URL = '/contentmanager/serviceapi';
 const JSON_ACCEPT_HEADERS = { 'Accept': 'application/json' };
 const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload').replace(/^\/+|\/+$/g, '');
@@ -10,6 +11,8 @@ const CHUNKED_UPLOAD_RESUME_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const CHUNKED_UPLOAD_RESUME_SWEEP_MAX_KEYS = 25;
 const CHUNKED_UPLOAD_SESSION_ID_REGEX = /^[a-z0-9]{32}$/i;
 
+let CHUNKED_UPLOAD_VERBOSE = false;
+
 let _chunkedUploadResumeSweepPromise = null;
 
 function clampChunkedUploadConcurrency(value) {
@@ -19,6 +22,35 @@ function clampChunkedUploadConcurrency(value) {
     if (parsed > 8) return 8;
     return parsed;
 }
+
+function coerceChunkedUploadBoolean(value, fallback) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true') return true;
+        if (normalized === 'false') return false;
+    }
+    return fallback;
+}
+
+function resolveChunkedUploadVerbose() {
+    if (window.CHUNKED_UPLOAD_VERBOSE !== undefined && window.CHUNKED_UPLOAD_VERBOSE !== null) {
+        return coerceChunkedUploadBoolean(window.CHUNKED_UPLOAD_VERBOSE, false);
+    }
+
+    try {
+        const persistedValue = localStorage.getItem(CHUNKED_UPLOAD_VERBOSE_STORAGE_KEY);
+        if (persistedValue !== null) {
+            return coerceChunkedUploadBoolean(persistedValue, false);
+        }
+    } catch (e) {
+        return false;
+    }
+
+    return false;
+}
+
+CHUNKED_UPLOAD_VERBOSE = resolveChunkedUploadVerbose();
 
 function getPersistedChunkedUploadConcurrency() {
     try {
@@ -55,6 +87,95 @@ window.setChunkedUploadConcurrency = function (value) {
 window.getChunkedUploadConcurrency = function () {
     return resolveChunkedUploadConcurrency();
 };
+
+function getChunkedUploadDebugBanner() {
+    let banner = document.getElementById(CHUNKED_UPLOAD_DEBUG_BANNER_ID);
+    if (banner) return banner;
+
+    banner = document.createElement('div');
+    banner.id = CHUNKED_UPLOAD_DEBUG_BANNER_ID;
+    banner.style.cssText = [
+        'display:none',
+        'position:fixed',
+        'top:0',
+        'left:0',
+        'right:0',
+        'z-index:100000',
+        'background:#fff4d6',
+        'border-bottom:1px solid #e0b252',
+        'color:#553600',
+        'font:600 12px/1.4 Segoe UI, Tahoma, sans-serif',
+        'padding:10px 16px',
+        'display:flex',
+        'align-items:center',
+        'justify-content:space-between',
+        'gap:16px',
+        'box-shadow:0 2px 10px rgba(0,0,0,0.08)'
+    ].join(';');
+
+    const message = document.createElement('div');
+    message.id = 'cm-chunked-upload-debug-banner-message';
+    banner.appendChild(message);
+
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;align-items:center;gap:12px;';
+
+    const turnOffButton = document.createElement('button');
+    turnOffButton.type = 'button';
+    turnOffButton.className = 'btn btn-flat btn-secondary';
+    turnOffButton.textContent = 'Turn off';
+    turnOffButton.onclick = function () {
+        window.setChunkedUploadVerbose(false);
+    };
+    actions.appendChild(turnOffButton);
+
+    banner.appendChild(actions);
+    document.body.appendChild(banner);
+    return banner;
+}
+
+function updateChunkedUploadDebugBanner() {
+    if (!document.body) return;
+
+    const banner = getChunkedUploadDebugBanner();
+    const message = banner.querySelector('#cm-chunked-upload-debug-banner-message');
+    if (!CHUNKED_UPLOAD_VERBOSE) {
+        banner.style.display = 'none';
+        return;
+    }
+
+    if (message) {
+        message.textContent = 'Chunked Upload debug mode is ON. Verbose browser logging and diagnostic helpers are enabled.';
+    }
+    banner.style.display = 'flex';
+}
+
+window.setChunkedUploadVerbose = function (value) {
+    const normalized = coerceChunkedUploadBoolean(value, false);
+    CHUNKED_UPLOAD_VERBOSE = normalized;
+    window.CHUNKED_UPLOAD_VERBOSE = normalized;
+    try {
+        localStorage.setItem(CHUNKED_UPLOAD_VERBOSE_STORAGE_KEY, String(normalized));
+    } catch (e) {
+        // Ignore localStorage write issues.
+    }
+
+    updateChunkedUploadDebugBanner();
+    return normalized;
+};
+
+window.getChunkedUploadVerbose = function () {
+    return CHUNKED_UPLOAD_VERBOSE === true;
+};
+
+function installChunkedUploadDebugBanner() {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', updateChunkedUploadDebugBanner, { once: true });
+        return;
+    }
+
+    updateChunkedUploadDebugBanner();
+}
 
 function logDebug() {
     if (!CHUNKED_UPLOAD_VERBOSE) return;
@@ -197,6 +318,7 @@ function getChunkedUploadOverlayText() {
 }
 
 logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
+installChunkedUploadDebugBanner();
 void ensureChunkedUploadResumeSweep();
 
 // ---------------------------------------------------------------------------
