@@ -14,6 +14,7 @@ record write in the same operation.
 The function supports:
 - Windows Integrated auth (-UseDefaultCredentials)
 - Basic auth (-Credential, or -Username with -Password)
+- OIDC/OAuth bearer tokens via -AuthHeaderValue "Bearer <access_token>"
 - File-signature-based session caching for resume across runs
 - One-time automatic fresh-session retry for contiguous complete failures
 - Optional cleanup of staged artifacts in StageOnly mode
@@ -55,8 +56,8 @@ SecureString password paired with -Username.
 Uses current Windows credentials for all HTTP requests.
 
 .PARAMETER StageOnly
-When true (default), complete returns staged metadata and native upload token data.
-When false, complete writes directly to record content.
+When false (default), complete writes directly to record content.
+When true, complete returns staged metadata and native upload token data.
 
 .PARAMETER NewRevision
 Check In option forwarded to upload start request.
@@ -92,6 +93,34 @@ Directly writes uploaded content to an existing record.
 Send-CmChunkedUpload -BaseUrl "http://server/contentmanager/serviceapi" -FilePath "C:\Temp\large.bin" -UseDefaultCredentials -StageOnly $false -RecordTypeUri 9876 -Title "Scripted upload"
 
 Creates a new record (non-stage-only) and attaches uploaded content.
+
+.EXAMPLE
+# OIDC client credentials flow example (token endpoint + bearer auth header).
+$tokenEndpoint = "https://idp.example.com/connect/token"
+$clientId = "your-client-id"
+$clientSecret = "your-client-secret"
+$scope = "cm.serviceapi"
+
+$tokenResponse = Invoke-RestMethod -Method Post -Uri $tokenEndpoint -ContentType "application/x-www-form-urlencoded" -Body @{
+        grant_type = "client_credentials"
+        client_id = $clientId
+        client_secret = $clientSecret
+        scope = $scope
+}
+
+$accessToken = [string]$tokenResponse.access_token
+if ([string]::IsNullOrWhiteSpace($accessToken)) {
+        throw "Token endpoint did not return access_token."
+}
+
+Send-CmChunkedUpload `
+    -BaseUrl "https://cm-host/contentmanager/serviceapi" `
+    -FilePath "C:\Temp\large.bin" `
+    -AuthHeaderValue "Bearer $accessToken" `
+    -StageOnly $true
+
+Requests an access token from an OIDC/OAuth token endpoint and sends it as a
+Bearer authorization header for ServiceAPI calls.
 #>
 
 function Send-CmChunkedUpload {
@@ -107,7 +136,7 @@ function Send-CmChunkedUpload {
         [string]$Username,
         [System.Security.SecureString]$Password,
         [switch]$UseDefaultCredentials,
-        [bool]$StageOnly = $true,
+        [bool]$StageOnly = $false,
         [bool]$NewRevision = $true,
         [bool]$KeepCheckedOut = $false,
         [string]$Comments = "Automated chunk upload",

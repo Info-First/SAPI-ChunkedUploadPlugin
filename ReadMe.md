@@ -131,7 +131,6 @@ Standalone client integration options:
 
 PowerShell helper notes (`Send-CMChunkedUpload.ps1`):
 
-- Defaults to `-StageOnly $true` to match browser script behavior.
 - Reuses cached session IDs by file signature and resumes via `/missing`.
 - Performs one-time automatic fresh-session retry when `/complete` reports a contiguous-session failure.
 - Supports optional immediate cleanup after completion with `-CleanupAfterComplete` (StageOnly mode).
@@ -237,10 +236,6 @@ Post-save hash verification depends on dataset document hashing being enabled.
 ### Cleanup returns HTTP 200 with empty body
 
 This is valid. The script treats empty cleanup response body as success.
-
-### Browser console errors from `chrome-extension://...`
-
-Errors referencing browser extensions (for example `recordingStatus`) are external to this plugin.
 
 ### Upload works in New Record but not in other forms
 
