@@ -591,7 +591,39 @@ async function abortChunkedUploadSessionById(sessionId) {
             if (isRecordSaveCall) {
                 xhr.addEventListener('load', async function () {
                     try {
-                        if (xhr.status < 200 || xhr.status >= 300) return;
+                        const isGatewayTimeout = xhr.status === 504 || xhr.status === 524;
+
+                        if (xhr.status < 200 || xhr.status >= 300) {
+                            if (isGatewayTimeout) {
+                                // CM record save timed out at the proxy — the server likely completed
+                                // the save but the response was dropped. We cannot verify the hash
+                                // (no URI in response), but we can still clean up staged artifacts
+                                // to prevent chunks lingering on disk.
+                                const pendingKeys = Object.keys(_chunkedUploadPendingOps);
+                                if (!pendingKeys.length) return;
+
+                                let pending = null;
+                                let matchedKey = null;
+                                for (const key of pendingKeys) {
+                                    if (typeof body === 'string' && body.includes(key.replace(/\\/g, '\\\\'))) {
+                                        pending = _chunkedUploadPendingOps[key];
+                                        matchedKey = key;
+                                        break;
+                                    }
+                                }
+                                if (!pending) {
+                                    matchedKey = pendingKeys[0];
+                                    pending = _chunkedUploadPendingOps[matchedKey];
+                                }
+                                if (!pending) return;
+
+                                console.warn(`[ChunkedUpload] Record save returned HTTP ${xhr.status}. Skipping hash verification; attempting cleanup of staged artifacts.`);
+                                unregisterPendingUpload(matchedKey, pending);
+                                await cleanupChunkedUpload(pending);
+                            }
+                            return;
+                        }
+
                         const data = JSON.parse(xhr.responseText);
                         if (!data || !data.Results || !data.Results.length) return;
                         const uri = data.Results[0].Uri;
@@ -1101,17 +1133,32 @@ async function uploadFileInChunks(file, onProgress, cancellationState, checkInOp
 
         // Step 3: Complete the Upload
         // Must use FormData so ValidateHttpAntiForgeryToken can find the token as a form field.
-        const completeFormData = createFormDataWithCsrf();
+        // Cloudflare can return gateway timeouts for long-running complete operations,
+        // so retry complete a small number of times before failing.
+        const maxCompleteAttempts = 3;
+        let completeRes = null;
+        for (let completeAttempt = 1; completeAttempt <= maxCompleteAttempts; completeAttempt++) {
+            const completeFormData = createFormDataWithCsrf();
+            completeRes = await fetch(buildUploadRoute(`${sessionId}/complete`), {
+                method: 'POST',
+                credentials: 'include',
+                headers: JSON_ACCEPT_HEADERS,
+                body: completeFormData,
+                signal: cancellationState && cancellationState.abortController ? cancellationState.abortController.signal : undefined
+            });
 
-        const completeRes = await fetch(buildUploadRoute(`${sessionId}/complete`), {
-            method: 'POST',
-            credentials: 'include',
-            headers: JSON_ACCEPT_HEADERS,
-            body: completeFormData,
-            signal: cancellationState && cancellationState.abortController ? cancellationState.abortController.signal : undefined
-        });
+            if (completeRes.ok) {
+                break;
+            }
 
-        if (!completeRes.ok) {
+            const isGatewayTimeout = completeRes.status === 504 || completeRes.status === 524;
+            if (isGatewayTimeout && completeAttempt < maxCompleteAttempts && !(cancellationState && cancellationState.cancelled)) {
+                const delayMs = 1500 * completeAttempt;
+                logDebug(`Complete call timed out (HTTP ${completeRes.status}). Retrying in ${delayMs}ms (attempt ${completeAttempt + 1}/${maxCompleteAttempts}).`);
+                await new Promise(function (resolve) { setTimeout(resolve, delayMs); });
+                continue;
+            }
+
             let detail = '';
             try {
                 detail = (await completeRes.text() || '').trim();

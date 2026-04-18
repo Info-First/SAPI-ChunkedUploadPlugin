@@ -1,53 +1,38 @@
-# SAPI Chunked Upload Plugin
+# Chunked Upload ServiceAPI Plugin
 
-This solution provides a Content Manager ServiceAPI plugin for resumable chunk uploads, plus an optional Web Client browser script integration.
+This project adds a custom Content Manager ServiceAPI plugin that supports resumable chunked uploads to a new or existing electronic record.
 
-## What this project includes
+## What it does
 
-- ServiceAPI routes for chunked upload session lifecycle and chunk transfer.
-- 4 MB chunk upload strategy with resumable missing-chunk support.
-- Stage-only completion path that returns a native CM `RecordFilePath` token (`userUri\\fileName`).
-- Optional Web Client script that intercepts native file input and drives chunked uploads.
-- Parallel chunk uploads with user-configurable concurrency.
-- Resume hardening (stale session sweep, resumed-tail healing, and one-time fresh-session retry on contiguous errors).
-- Overlay cancel support and uploaded-file delete integration (`DELETE /Upload/{SessionId}`) from CM UI.
-- Post-save document hash verification (single lookup).
-- Post-save cleanup call to delete staged session artifacts.
+- Starts an upload session for a target record.
+- Accepts binary chunks over POST or PUT.
+- Stores chunks on disk until the upload is complete.
+- Reassembles the file server-side.
+- Checks the assembled file into the target Content Manager record.
+- Supports upload status queries and upload cancellation.
 
-## Deployment topologies
+## Project layout
 
-This plugin supports two deployment models.
+- ChunkedUploadPlugin.sln
+- ChunkedUploadPlugin/ChunkedUploadPlugin.csproj
+- ChunkedUploadPlugin/ChunkedUploadService.cs
+- ChunkedUploadPlugin/UploadSessionStore.cs
+- lib/ReadMe.md
 
-1. Web Client hosted ServiceAPI
-: Plugin is loaded by the Web Client ServiceAPI host and used by `custom/chunker.js`.
+## Required assemblies
 
-2. Standalone ServiceAPI host
-: Plugin is loaded by a standalone ServiceAPI site or service. Browser script is optional and usually not required unless you are integrating a custom UI.
+Copy the required Content Manager and ServiceStack assemblies into the lib folder before building. See lib/ReadMe.md for the exact list.
 
-## Key files
+## Build
 
-- `ChunkedUploadPlugin/ChunkedUploadService.cs`
-- `ChunkedUploadPlugin/UploadSessionStore.cs`
-- `ChunkedUploadPlugin/Send-CMChunkedUpload.ps1` (standalone/API testing helper)
-- `custom/chunker.js` (Web Client integration script)
+1. Copy the required DLLs into the lib folder.
+2. Open ChunkedUploadPlugin.sln in Visual Studio.
+3. Build the ChunkedUploadPlugin project.
+4. Copy ChunkedUploadPlugin.dll to the Content Manager ServiceAPI bin folder.
 
-## Endpoint reference
+## Plugin configuration
 
-All routes are under `Upload`:
-
-- `POST /Upload/start`
-- `GET /Upload/{SessionId}`
-- `GET /Upload/{SessionId}/missing`
-- `POST /Upload/{SessionId}/chunk/{ChunkNumber}`
-- `PUT /Upload/{SessionId}/chunk/{ChunkNumber}`
-- `POST /Upload/{SessionId}/complete`
-- `POST /Upload/{SessionId}/cancel`
-- `DELETE /Upload/{SessionId}`
-- `POST /Upload/cleanup`
-
-## Configuration
-
-Register the plugin assembly in `hprmServiceAPI.config`:
+Add this to hptrim.config or hprmServiceAPI.config as a child of the hptrim element:
 
 ```xml
 <pluginAssemblies>
@@ -55,210 +40,235 @@ Register the plugin assembly in `hprmServiceAPI.config`:
 </pluginAssemblies>
 ```
 
-Optional `appSettings`:
+Optional appSettings values:
 
 ```xml
 <appSettings>
-  <add key="ChunkedUpload.TempPath" value="D:\\Micro Focus Content Manager\\ServiceAPIWorkpath\\ChunkedUploads" />
+  <add key="ChunkedUpload.TempPath" value="D:\CMUploads\Temp" />
   <add key="ChunkedUpload.SessionExpiryHours" value="24" />
-  <add key="ChunkedUpload.NativeUploadBasePath" value="D:\\Micro Focus Content Manager\\ServiceAPIWorkpath\\Uploads" />
 </appSettings>
 ```
 
-Setting notes:
+## Endpoints
 
-- `ChunkedUpload.TempPath`: session folders, chunk parts, and assembled temp file location.
-- `ChunkedUpload.SessionExpiryHours`: expiration window used by session validation.
-- `ChunkedUpload.NativeUploadBasePath`: destination root for native CM upload token file copy.
+### 0. End-to-end checksum verification
 
-## Installation: Web Client deployment
+When the upload is completed, the server calculates the document hash of the fully assembled file (using `TRIM.SDK.Database.CalculateDocumentHash`) and returns it in the response to POST `/ChunkedUpload/{sessionId}/complete` as `AssembledSha256`. 
 
-Use this when ServiceAPI is hosted by Content Manager Web Client.
+The client script (`Send-CMChunkedUpload.ps1`) automatically calculates the local file's SHA256 checksum and compares it against this returned value to verify file integrity.
 
-1. Build `ChunkedUploadPlugin.sln`.
-2. Copy `ChunkedUploadPlugin.dll` to the Web Client `bin` folder.
-3. Update Web Client `hprmServiceAPI.config` with plugin registration and optional appSettings.
-4. Copy `custom/chunker.js` into the Web Client `custom` folder.
-5. Update `Views/Home/Index.cshtml` to include:
+### 1. Resumable Uploads
 
-```cshtml
-<script src="@Url.Content("~/custom/chunker.js")"></script>
+This plugin supports resumable uploads. If an upload is interrupted, you can resume by querying which chunks are missing and uploading only those. The provided PowerShell script automates this process and supports parallel chunk uploads.
+
+#### Query missing chunks
+
+GET /ChunkedUpload/{sessionId}/missing
+
+Returns a list of missing chunk numbers for the session. Use this to resume interrupted uploads efficiently.
+
+#### Cancel an upload session
+
+POST /ChunkedUpload/{sessionId}/cancel
+
+Cancels and deletes the upload session and all associated data.
+
+### 2. Start a session
+
+POST /ChunkedUpload/start
+
+#### Upload to an existing record
+```json
+{
+  "RecordUri": 9000000001,
+  "FileName": "large-document.pdf",
+  "ContentType": "application/pdf",
+  "TotalBytes": 52428800,
+  "ExpectedChunkCount": 50,
+  "NewRevision": true,
+  "KeepCheckedOut": false,
+  "Comments": "Uploaded in chunks"
+}
 ```
 
-6. Recycle app pool or restart the Web Client site.
-7. Hard refresh browser (Ctrl+F5).
-
-**Important deployment note:**
-
-The active runtime script is the Web Client file copy at `C:\Program Files\Micro Focus\Content Manager\Web Client\custom\chunker.js`, not the repo source. This is the file the browser loads and executes. Changes to the repo source will not take effect until you copy the updated file into the Web Client custom folder and the browser refreshes. For development/testing, keep both in sync; for production, only the deployed Web Client copy matters.
-
-Web Client script notes:
-
-- Script currently targets ServiceAPI base path `/contentmanager/serviceapi`.
-- Script sends anti-forgery token as `__RequestVerificationToken` in multipart `FormData` for POST calls.
-- Script uses `credentials: include`/`withCredentials = true` for Windows auth continuity.
-- Default max parallel chunks is `4` (runtime configurable):
-
-```javascript
-window.setChunkedUploadConcurrency(4);
-window.getChunkedUploadConcurrency();
+#### Create a new record before upload
+If you do not supply `RecordUri`, you must provide `RecordTypeUri` (the URI of the record type to create) and `Title` (the new record's title):
+```json
+{
+  "RecordTypeUri": 2,
+  "Title": "My New Document",
+  "FileName": "large-document.pdf",
+  "ContentType": "application/pdf",
+  "TotalBytes": 52428800,
+  "ExpectedChunkCount": 50,
+  "NewRevision": true,
+  "KeepCheckedOut": false,
+  "Comments": "Uploaded in chunks"
+}
 ```
 
-- Verbose diagnostics toggle:
+Example response:
 
-```javascript
-window.setChunkedUploadVerbose(true);
-window.getChunkedUploadVerbose();
+```json
+{
+  "SessionId": "2e5f271a29cf45b3a45d09bde2635ea8",
+  "UploadChunkUrlTemplate": "https://server/cm/serviceapi/ChunkedUpload/2e5f271a29cf45b3a45d09bde2635ea8/chunk/{chunkNumber}",
+  "CompleteUrl": "https://server/cm/serviceapi/ChunkedUpload/2e5f271a29cf45b3a45d09bde2635ea8/complete",
+  "StatusUrl": "https://server/cm/serviceapi/ChunkedUpload/2e5f271a29cf45b3a45d09bde2635ea8",
+  "ExpiresUtc": "2026-03-25T04:00:00Z"
+}
 ```
 
-- Resume metadata is periodically swept from localStorage when sessions are stale/invalid.
+### 3. Upload each chunk
 
-## Installation: standalone ServiceAPI deployment
+PUT or POST /ChunkedUpload/{sessionId}/chunk/{chunkNumber}?offset={offset}&totalBytes={totalBytes}
 
-Use this when ServiceAPI runs independently from Web Client.
+Send the raw binary chunk as the request body.
 
-1. Build `ChunkedUploadPlugin.sln`.
-2. Copy `ChunkedUploadPlugin.dll` to the standalone ServiceAPI host `bin` folder.
-3. Update standalone `hprmServiceAPI.config` with plugin registration and optional appSettings.
-4. Restart the standalone ServiceAPI host/service.
-5. Validate endpoint availability with `GET /Upload/{sessionId}` after creating a test session.
+Recommended headers:
 
-Standalone client integration options:
+- Content-Type: application/octet-stream
+- Content-Range: bytes 0-1048575/52428800
+- X-Content-SHA256: optional if your client maps that to the Sha256 query value
 
-- Use your own HTTP client against `Upload/*` routes.
-- Use `ChunkedUploadPlugin/Send-CMChunkedUpload.ps1` for scripted upload testing.
-- If you choose to use `custom/chunker.js` outside Web Client, adjust its base path constant to your standalone ServiceAPI root and ensure equivalent CSRF/auth behavior.
+If your client can easily send query parameters, include:
 
-PowerShell helper notes (`Send-CMChunkedUpload.ps1`):
+- offset
+- totalBytes
+- sha256
 
-- Reuses cached session IDs by file signature and resumes via `/missing`.
-- Performs one-time automatic fresh-session retry when `/complete` reports a contiguous-session failure.
-- Supports optional immediate cleanup after completion with `-CleanupAfterComplete` (StageOnly mode).
-- Exposes Check In/session flags: `-NewRevision`, `-KeepCheckedOut`, `-Comments`.
+### 4. Check status
 
-Example commands:
+GET /ChunkedUpload/{sessionId}
+
+### 5. Complete the upload
+
+POST /ChunkedUpload/{sessionId}/complete
+
+The plugin assembles all chunks and calls the CM SDK to set the document on the target record.
+
+### 6. Abort the upload
+
+DELETE /ChunkedUpload/{sessionId}
+
+### 7. Cancel the upload (alternative)
+
+POST /ChunkedUpload/{sessionId}/cancel
+
+Cancels and deletes the upload session and all associated data. Use this if you want to explicitly cancel via POST.
+
+## PowerShell Client Example
+
+The included `Send-CMChunkedUpload.ps1` script automates chunked uploads, supports resumable and parallel uploads, and performs end-to-end checksum verification. Example usage:
 
 ```powershell
-# 1) Stage-only upload (default behavior), then cleanup staged artifacts immediately.
+# Dot-source the script
 . .\ChunkedUploadPlugin\Send-CMChunkedUpload.ps1
-Send-CmChunkedUpload `
-  -BaseUrl "http://your-host/contentmanager/serviceapi" `
-  -FilePath "C:\Temp\large-file.bin" `
-  -UseDefaultCredentials `
-  -StageOnly $true `
-  -CleanupAfterComplete
 
-# 2) Non-stage-only upload: complete directly into a record.
-. .\ChunkedUploadPlugin\Send-CMChunkedUpload.ps1
-Send-CmChunkedUpload `
-  -BaseUrl "http://your-host/contentmanager/serviceapi" `
-  -FilePath "C:\Temp\large-file.bin" `
-  -UseDefaultCredentials `
-  -StageOnly $false `
-  -RecordUri 12345 `
-  -NewRevision $true `
-  -KeepCheckedOut $false `
-  -Comments "Uploaded by scripted chunked upload"
+# Option A: Upload to an existing record
+Send-CmChunkedUpload -BaseUrl "https://server/cm/serviceapi" -FilePath "C:\largefile.bin" -RecordUri 9000000001 -ChunkSizeBytes 4MB -Username "admin" -Password (Read-Host -AsSecureString)
 
-# 3) Non-stage-only upload: create a new record using RecordTypeUri + Title.
-. .\ChunkedUploadPlugin\Send-CMChunkedUpload.ps1
-Send-CmChunkedUpload `
-  -BaseUrl "http://your-host/contentmanager/serviceapi" `
-  -FilePath "C:\Temp\large-file.bin" `
-  -UseDefaultCredentials `
-  -StageOnly $false `
-  -RecordTypeUri 9876 `
-  -Title "Scripted upload example" `
-  -NewRevision $true `
-  -KeepCheckedOut $false `
-  -Comments "Created with Send-CmChunkedUpload"
+# Option B: Create a new record and upload to it
+# (Title will default to the filename if omitted)
+Send-CmChunkedUpload -BaseUrl "https://server/cm/serviceapi" -FilePath "C:\largefile.bin" -RecordTypeUri 2 -Title "My Large Document"
 ```
 
-## Runtime flow (Web Client script path)
+Key features:
+- Automatically creates new records or attaches to existing ones.
+- Resumes interrupted uploads by querying the `/missing` endpoint.
+- Performs end-to-end SHA256 checksum verification after assembly.
+- Handles authentication (Basic Auth or Default Credentials).
+- Uses exponential backoff for retries on individual chunks.
 
-1. User selects or drags a file in New Record or Check In upload UI.
-2. Script intercepts file input change/dropzone drop and starts chunk session.
-3. Script queries missing chunks and uploads only missing chunks.
-4. Script completes session and receives:
-   - `StagedFilePath`
-   - `RecordFilePath` (`userUri\\fileName`)
-   - `FullUploadedFileName`
-   - `AssembledSha256`
-5. Script injects `uploadedFiles` KO payload so normal CM save uses `RecordFilePath`.
-6. After successful record save:
-  - script verifies record hash
-  - script calls `/Upload/cleanup`
+See the script for more details and parameters.
 
-Runtime behaviors:
+## C# Client Example
 
-- Upload chunks are sent in parallel batches (default 4 concurrent).
-- User cancel aborts in-flight request/retry timers and calls `POST /Upload/{SessionId}/cancel`.
-- If a resumed session fails `/complete` with `Uploaded chunks are not contiguous`, script clears cached session, aborts it, and retries once with a fresh session.
-- On resumed sessions, a small tail-window of already uploaded chunks is re-sent before complete to heal interrupted writes.
+Here is a basic example using `System.Net.Http.HttpClient` to upload a file in chunks from a C# application:
 
-## Verification checklist
+```csharp
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
 
-Web Client deployment:
+public class ChunkedUploadClient
+{
+    public static async Task UploadFileAsync(string baseUrl, string filePath, long recordUri, string username, string password)
+    {
+        var fileInfo = new FileInfo(filePath);
+        int chunkSize = 4 * 1024 * 1024; // 4MB chunks
+        int expectedChunks = (int)Math.Ceiling((double)fileInfo.Length / chunkSize);
 
-- Upload requests appear under `Upload/*`.
-- Record save includes `RecordFilePath` in `userUri\\fileName` format.
-- Record creates successfully with electronic document attached.
-- Console shows hash verification success or mismatch message.
-- Cleanup call returns success (empty body is acceptable).
+        using var client = new HttpClient();
+        var authBytes = Encoding.ASCII.GetBytes($"{username}:{password}");
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(authBytes));
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-Standalone deployment:
+        // 1. Start the Session
+        var startPayload = new
+        {
+            RecordUri = recordUri,
+            FileName = fileInfo.Name,
+            ContentType = "application/octet-stream",
+            TotalBytes = fileInfo.Length,
+            ExpectedChunkCount = expectedChunks,
+            NewRevision = true,
+            KeepCheckedOut = false
+        };
 
-- `start`, `missing`, `chunk`, and `complete` routes succeed end-to-end.
-- Session folders are created under `ChunkedUpload.TempPath`.
-- Native upload copy path resolves under `ChunkedUpload.NativeUploadBasePath`.
-- `cleanup` removes session/temp artifacts as expected.
+        var startContent = new StringContent(JsonSerializer.Serialize(startPayload), Encoding.UTF8, "application/json");
+        var startRes = await client.PostAsync($"{baseUrl}/UploadChunks/start", startContent);
+        startRes.EnsureSuccessStatusCode();
+        
+        using var startStream = await startRes.Content.ReadAsStreamAsync();
+        var startResponseData = await JsonSerializer.DeserializeAsync<JsonElement>(startStream);
+        string sessionId = startResponseData.GetProperty("SessionId").GetString();
+        Console.WriteLine($"[INFO] Started session: {sessionId}");
 
-## Supported upload entry points
+        // 2. Upload the Chunks
+        using var fs = File.OpenRead(filePath);
+        byte[] buffer = new byte[chunkSize];
+        int bytesRead;
+        int chunkNumber = 0;
+        long offset = 0;
 
-The chunked upload integration works with any CM action that uses the standard file upload widget (TRIMFileUpload or files[] input):
+        while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
+        {
+            Console.WriteLine($"[INFO] Uploading chunk {chunkNumber}...");
+            using var chunkContent = new ByteArrayContent(buffer, 0, bytesRead);
+            chunkContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            
+            long to = offset + bytesRead - 1;
+            chunkContent.Headers.Add("Content-Range", $"bytes {offset}-{to}/{fileInfo.Length}");
 
-- **New Record** — create a new record with an electronic document attached
-- **Check In** — attach an electronic object to an existing metadata-only record or create a new revision
-- **MainObjectUpdateTaskForm-based tasks** — any workflow or custom task that includes a file field
-- **Any custom form** using `files[]` input in the Web Client
+            var uploadRes = await client.PutAsync($"{baseUrl}/UploadChunks/{sessionId}/chunk/{chunkNumber}", chunkContent);
+            uploadRes.EnsureSuccessStatusCode();
 
-The integration intercepts file input changes and dropzone events globally via event capture, so all forms automatically benefit from chunked upload and cancellation support.
+            offset += bytesRead;
+            chunkNumber++;
+        }
 
-## Troubleshooting
+        // 3. Complete the Upload
+        Console.WriteLine($"[INFO] Completing upload session {sessionId}...");
+        var completeRes = await client.PostAsync($"{baseUrl}/UploadChunks/{sessionId}/complete", new StringContent("{}", Encoding.UTF8, "application/json"));
+        completeRes.EnsureSuccessStatusCode();
+        
+        using var completeStream = await completeRes.Content.ReadAsStreamAsync();
+        var completeData = await JsonSerializer.DeserializeAsync<JsonElement>(completeStream);
+        Console.WriteLine($"[SUCCESS] Upload complete! Record URI: {completeData.GetProperty("RecordUri").GetInt64()}");
+        Console.WriteLine($"[SUCCESS] Assembled SHA256: {completeData.GetProperty("AssembledSha256").GetString()}");
+    }
+}
+```
 
-### Hash verification empty value
+## Notes
 
-Post-save hash verification depends on dataset document hashing being enabled.
-
-- If dataset hashing is disabled, ServiceAPI can return empty `RecordDocumentHash`.
-- Enable dataset document hashing before relying on verification output.
-
-### Cleanup returns HTTP 200 with empty body
-
-This is valid. The script treats empty cleanup response body as success.
-
-### Upload works in New Record but not in other forms
-
-The chunked upload integration uses event capture on `files[]` inputs, which may conflict with form initialization order in some edge cases. If another form isn't triggering the upload:
-
-1. Open browser developer tools (F12) and check the Console tab.
-2. Set `window.CHUNKED_UPLOAD_VERBOSE = true` and reload to enable debug logging.
-3. Check that the file input has `name="files[]"` attribute.
-4. Verify the form is using the standard TRIMFileUpload widget.
-5. If still not working, file an issue with the form name and debug output.
-
-## Recent changes
-
-- Added post-save hash verification against record hash properties (`RecordDocumentHash` with fallback handling).
-- Added post-save cleanup endpoint (`POST /Upload/cleanup`) for session/temp/native file cleanup.
-- Updated Web Client script to call cleanup after successful record save.
-- Simplified hash verification to single-lookup mode (no retry loop).
-- Reduced script console noise with verbose debug toggle (`window.CHUNKED_UPLOAD_VERBOSE = true`).
-- Added duplicate-install guards for XHR interceptor and file-input change handler.
-- Expanded Web Client interception to support Check In modal upload flows (including drag/drop zone handling).
-- Added stale resume-key cleanup and resumed-upload progress messaging.
-- Added configurable parallel chunk upload concurrency and persisted verbose debug switch.
-- Added uploaded-file delete hooks to abort matching chunk sessions after confirmation.
-- Hardened contiguous-error recovery in browser flow with fresh-session retry and resumed-tail healing.
-- Hardened cancel/delete race handling server-side to avoid transient directory-lock cancellation failures.
-- Updated `Send-CMChunkedUpload.ps1` to support stage-only defaults, resumable session cache, contiguous-error recovery retry, and optional cleanup.
+- This implementation targets existing records by `RecordUri` or creates new ones via `RecordTypeUri`.
+- Chunks are persisted on disk so large uploads do not stay in memory.
+- Completion requires contiguous chunks with matching total size if `TotalBytes` was supplied.
+- The plugin assumes the ServiceAPI process identity can read and write the temporary upload path.
+- The exact behaviour of `Record.SetDocument` can vary slightly across CM versions, so test against your installed SDK version.

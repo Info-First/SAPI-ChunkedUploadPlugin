@@ -283,6 +283,7 @@ namespace HP.HPTRIM.ServiceAPI
             var session = sessionStore.GetRequiredSession(request.SessionId);
             string assembledPath = null;
             string assembledSha256 = null;
+            bool calculateTrimHash = ShouldCalculateTrimHash();
             try
             {
                 Logger.Info($"[CompleteChunkedUpload] SessionId={request.SessionId}, RecordUri={session.RecordUri}, FileName={session.FileName}, StageOnly={session.StageOnly}");
@@ -296,14 +297,17 @@ namespace HP.HPTRIM.ServiceAPI
 
                 if (session.StageOnly)
                 {
-                    try
+                    if (calculateTrimHash)
                     {
-                        trimHash = Database.CalculateDocumentHash(assembledPath);
-                        Logger.Info($"[CompleteChunkedUpload] TRIM SDK Calculated Hash for staging: {trimHash}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Warn($"[CompleteChunkedUpload] Failed to calculate TRIM hash: {ex.Message}");
+                        try
+                        {
+                            trimHash = Database.CalculateDocumentHash(assembledPath);
+                            Logger.Info($"[CompleteChunkedUpload] TRIM SDK Calculated Hash for staging: {trimHash}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn($"[CompleteChunkedUpload] Failed to calculate TRIM hash: {ex.Message}");
+                        }
                     }
 
                     string recordFilePath = null;
@@ -318,15 +322,17 @@ namespace HP.HPTRIM.ServiceAPI
                         Logger.Warn($"[CompleteChunkedUpload] Failed to prepare native upload token: {ex}");
                     }
 
+                    // assembled.bin has been moved to fullUploadedFileName by PrepareNativeUploadToken;
+                    // use session.TotalBytes for size (file is no longer at assembledPath).
                     return new CompleteChunkedUploadResponse
                     {
                         RecordUri = session.RecordUri,
                         FileName = session.FileName,
-                        UploadedBytes = new FileInfo(assembledPath).Length,
+                        UploadedBytes = session.TotalBytes,
                         NewRevision = session.NewRevision,
                         KeepCheckedOut = session.KeepCheckedOut,
                         AssembledSha256 = trimHash ?? assembledSha256,
-                        StagedFilePath = assembledPath,
+                        StagedFilePath = fullUploadedFileName ?? assembledPath,
                         RecordFilePath = recordFilePath,
                         FullUploadedFileName = fullUploadedFileName
                     };
@@ -349,8 +355,11 @@ namespace HP.HPTRIM.ServiceAPI
                 string comments = string.IsNullOrWhiteSpace(session.Comments) ? "Uploaded via ChunkedUploadPlugin" : session.Comments;
                 try
                 {
-                    trimHash = Database.CalculateDocumentHash(assembledPath);
-                    Logger.Info($"[CompleteChunkedUpload] TRIM SDK Calculated Hash before checkin: {trimHash}");
+                    if (calculateTrimHash)
+                    {
+                        trimHash = Database.CalculateDocumentHash(assembledPath);
+                        Logger.Info($"[CompleteChunkedUpload] TRIM SDK Calculated Hash before checkin: {trimHash}");
+                    }
 
                     record.SetDocument(inputDocument, session.NewRevision, session.KeepCheckedOut, comments);
                     record.Save();
@@ -367,10 +376,10 @@ namespace HP.HPTRIM.ServiceAPI
                 {
                     RecordUri = session.RecordUri,
                     FileName = session.FileName,
-                    UploadedBytes = new FileInfo(assembledPath).Length,
+                    UploadedBytes = session.TotalBytes,
                     NewRevision = session.NewRevision,
                     KeepCheckedOut = session.KeepCheckedOut,
-                    AssembledSha256 = trimHash
+                    AssembledSha256 = trimHash ?? assembledSha256
                 };
             }
             catch (Exception ex)
@@ -407,7 +416,26 @@ namespace HP.HPTRIM.ServiceAPI
             Directory.CreateDirectory(userUploadDirectory);
 
             var targetFilePath = Path.Combine(userUploadDirectory, sanitizedFileName);
-            File.Copy(assembledPath, targetFilePath, true);
+
+            // Prefer Move over Copy: on the same drive this is a near-instant metadata
+            // operation regardless of file size. Fall back to Copy+Delete when source
+            // and destination reside on different volumes (Move throws IOException).
+            if (File.Exists(targetFilePath))
+            {
+                File.Delete(targetFilePath);
+            }
+
+            try
+            {
+                File.Move(assembledPath, targetFilePath);
+            }
+            catch (IOException)
+            {
+                // Cross-volume fallback: still copies bytes, but cleans up source afterwards
+                // so at least we avoid doubling IO from a later session delete.
+                File.Copy(assembledPath, targetFilePath, true);
+                try { File.Delete(assembledPath); } catch { /* best-effort */ }
+            }
 
             recordFilePath = userFolderName + "\\" + sanitizedFileName;
             fullUploadedFileName = targetFilePath;
@@ -440,6 +468,18 @@ namespace HP.HPTRIM.ServiceAPI
             }
 
             return @"D:\Micro Focus Content Manager\ServiceAPIWorkpath\Uploads";
+        }
+
+        private static bool ShouldCalculateTrimHash()
+        {
+            var configured = ConfigurationManager.AppSettings["ChunkedUpload.CalculateTrimHash"];
+            if (string.IsNullOrWhiteSpace(configured))
+            {
+                return false;
+            }
+
+            bool enabled;
+            return bool.TryParse(configured, out enabled) && enabled;
         }
 
         public object Delete(AbortChunkedUpload request)
