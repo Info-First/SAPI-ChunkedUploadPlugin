@@ -5,6 +5,7 @@ const JSON_ACCEPT_HEADERS = { 'Accept': 'application/json' };
 const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload').replace(/^\/+|\/+$/g, '');
 const CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT = 4;
 const CHUNKED_UPLOAD_MAX_CONCURRENT_STORAGE_KEY = 'cm_chunked_upload_max_concurrent';
+const CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT = 1024;
 const CHUNKED_UPLOAD_RESUME_KEY_PREFIX = 'cm_upload_staged_';
 const CHUNKED_UPLOAD_RESUME_SWEEP_MARKER_KEY = 'cm_upload_staged_last_sweep_utc';
 const CHUNKED_UPLOAD_RESUME_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -12,6 +13,7 @@ const CHUNKED_UPLOAD_RESUME_SWEEP_MAX_KEYS = 25;
 const CHUNKED_UPLOAD_SESSION_ID_REGEX = /^[a-z0-9]{32}$/i;
 
 let CHUNKED_UPLOAD_VERBOSE = false;
+let _chunkedUploadLargeFileTimeoutRecoveryShown = false;
 
 let _chunkedUploadResumeSweepPromise = null;
 
@@ -73,6 +75,37 @@ function resolveChunkedUploadConcurrency() {
 
     return CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT;
 }
+
+function resolveChunkedUploadLargeFilePilotThresholdMb() {
+    const configured = window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB;
+    const parsed = parseInt(configured, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
+    }
+    return parsed;
+}
+
+function resolveChunkedUploadLargeFilePilotThresholdBytes() {
+    return resolveChunkedUploadLargeFilePilotThresholdMb() * 1024 * 1024;
+}
+
+function isChunkedUploadLargeFilePilotCandidate(fileSize) {
+    const normalizedSize = Number(fileSize || 0);
+    return Number.isFinite(normalizedSize) && normalizedSize >= resolveChunkedUploadLargeFilePilotThresholdBytes();
+}
+
+window.getChunkedUploadLargeFilePilotThresholdMb = function () {
+    return resolveChunkedUploadLargeFilePilotThresholdMb();
+};
+
+window.setChunkedUploadLargeFilePilotThresholdMb = function (value) {
+    const parsed = parseInt(value, 10);
+    const normalized = (!Number.isFinite(parsed) || parsed <= 0)
+        ? CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT
+        : parsed;
+    window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB = normalized;
+    return normalized;
+};
 
 window.setChunkedUploadConcurrency = function (value) {
     const normalized = clampChunkedUploadConcurrency(value);
@@ -466,6 +499,32 @@ function unregisterPendingUpload(uploadedFileName, pending) {
     }
 }
 
+function notifyChunkedUploadLargeFileTimeoutRecovery(pending, statusCode) {
+    if (_chunkedUploadLargeFileTimeoutRecoveryShown) {
+        return;
+    }
+
+    _chunkedUploadLargeFileTimeoutRecoveryShown = true;
+    const fileName = pending && pending.originalFileName ? pending.originalFileName : 'the selected file';
+    const thresholdMb = resolveChunkedUploadLargeFilePilotThresholdMb();
+
+    const message =
+        `Large-file save request timed out (HTTP ${statusCode}) after chunk upload completed for ${fileName}. ` +
+        `The record may have been created successfully. The page will refresh to clear the stuck save spinner. ` +
+        `(Pilot threshold: ${thresholdMb} MB)`;
+
+    console.warn('[ChunkedUpload]', message);
+
+    setTimeout(function () {
+        try {
+            alert(message);
+        } catch (e) {
+            // Ignore alert issues and continue with refresh.
+        }
+        window.location.reload();
+    }, 50);
+}
+
 async function abortChunkedUploadSessionForOriginalFile(originalFileName) {
     const originalKey = normalizeOriginalFileName(originalFileName);
     if (!originalKey) return;
@@ -620,6 +679,10 @@ async function abortChunkedUploadSessionById(sessionId) {
                                 console.warn(`[ChunkedUpload] Record save returned HTTP ${xhr.status}. Skipping hash verification; attempting cleanup of staged artifacts.`);
                                 unregisterPendingUpload(matchedKey, pending);
                                 await cleanupChunkedUpload(pending);
+
+                                if (pending.isLargeFilePilotCandidate === true) {
+                                    notifyChunkedUploadLargeFileTimeoutRecovery(pending, xhr.status);
+                                }
                             }
                             return;
                         }
@@ -1477,6 +1540,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
 
     const koViewModel = resolveUploadKoViewModel(contextElement);
     const checkInOptions = resolveCheckInOptionsFromContext(contextElement);
+    const isLargeFilePilotCandidate = isChunkedUploadLargeFilePilotCandidate(file.size);
     const cancellationState = {
         cancelled: false,
         sessionId: '',
@@ -1502,6 +1566,10 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
         const uploadedFileName = result.RecordFilePath || result.StagedFilePath;
         const fullUploadedFileName = result.FullUploadedFileName || result.StagedFilePath;
 
+        if (isLargeFilePilotCandidate) {
+            logDebug(`Large-file pilot is active for ${file.name} (${file.size} bytes). Threshold=${resolveChunkedUploadLargeFilePilotThresholdMb()} MB.`);
+        }
+
         // Register post-save verification + cleanup metadata.
         if (uploadedFileName) {
             registerPendingUpload(uploadedFileName, {
@@ -1510,7 +1578,9 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
                 stagedFilePath: result.StagedFilePath || '',
                 fullUploadedFileName: result.FullUploadedFileName || '',
                 fileCacheKey: cancellationState.fileCacheKey || '',
-                originalFileName: file.name
+                originalFileName: file.name,
+                fileSize: file.size || 0,
+                isLargeFilePilotCandidate: isLargeFilePilotCandidate
             }, file.name);
             logDebug('Registered pending post-save operations for:', uploadedFileName);
         }
