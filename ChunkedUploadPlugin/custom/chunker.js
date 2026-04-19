@@ -20,6 +20,7 @@ const CHUNKED_UPLOAD_SESSION_ID_REGEX = /^[a-z0-9]{32}$/i;
 let CHUNKED_UPLOAD_VERBOSE = false;
 let _chunkedUploadLargeFileTimeoutRecoveryShown = false;
 let _chunkedUploadAsyncBadgeAutoDismissTimer = null;
+let _chunkedUploadAsyncBadgeTransientSuppressed = false;
 
 let _chunkedUploadResumeSweepPromise = null;
 
@@ -136,12 +137,14 @@ function getChunkedUploadDebugBanner() {
     banner.style.cssText = [
         'display:none',
         'position:fixed',
-        'bottom:0',
-        'left:0',
-        'right:0',
+        'bottom:8px',
+        'left:16px',
+        'right:auto',
+        'width:min(720px, calc(100vw - 32px))',
         'z-index:100000',
         'background:#fff4d6',
-        'border-top:1px solid #e0b252',
+        'border:1px solid #e0b252',
+        'border-radius:10px',
         'color:#553600',
         'font:600 12px/1.4 Segoe UI, Tahoma, sans-serif',
         'padding:10px 16px',
@@ -173,6 +176,27 @@ function getChunkedUploadDebugBanner() {
     return banner;
 }
 
+function applyChunkedUploadPageBottomInset(px) {
+    if (!document.body) return;
+
+    const normalized = Math.max(0, Number(px) || 0);
+    if (normalized <= 0) {
+        document.body.style.removeProperty('padding-bottom');
+        return;
+    }
+
+    document.body.style.setProperty('padding-bottom', `${normalized}px`, 'important');
+}
+
+function resolveChunkedUploadDebugBannerInsetPx() {
+    const banner = document.getElementById(CHUNKED_UPLOAD_DEBUG_BANNER_ID);
+    if (!banner || banner.style.display === 'none') {
+        return 0;
+    }
+
+    return (banner.offsetHeight || 0) + 8;
+}
+
 function updateChunkedUploadDebugBanner() {
     if (!document.body) return;
 
@@ -180,6 +204,7 @@ function updateChunkedUploadDebugBanner() {
     const message = banner.querySelector('#cm-chunked-upload-debug-banner-message');
     if (!CHUNKED_UPLOAD_VERBOSE) {
         banner.style.display = 'none';
+        applyChunkedUploadPageBottomInset(0);
         syncAsyncAttachBadgeBottomOffset();
         return;
     }
@@ -188,6 +213,7 @@ function updateChunkedUploadDebugBanner() {
         message.textContent = 'Chunked Upload debug mode is ON. Verbose browser logging and diagnostic helpers are enabled.';
     }
     banner.style.display = 'flex';
+    applyChunkedUploadPageBottomInset(resolveChunkedUploadDebugBannerInsetPx());
     syncAsyncAttachBadgeBottomOffset();
 }
 
@@ -308,6 +334,10 @@ function getOrCreateAsyncAttachBadge() {
     dismissButton.textContent = 'Dismiss';
     dismissButton.style.cssText = 'white-space:nowrap;padding:4px 10px;';
     dismissButton.onclick = function () {
+        const currentState = String(badge.dataset.state || '').toLowerCase();
+        if (currentState === 'queued' || currentState === 'running') {
+            _chunkedUploadAsyncBadgeTransientSuppressed = true;
+        }
         updateAsyncAttachBadge(null, 'hidden');
     };
     badge.appendChild(dismissButton);
@@ -503,6 +533,7 @@ logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
 installChunkedUploadDebugBanner();
 restoreAsyncAttachBadgeFromSession();
 window.addEventListener('resize', syncAsyncAttachBadgeBottomOffset);
+window.addEventListener('resize', updateChunkedUploadDebugBanner);
 void ensureChunkedUploadResumeSweep();
 
 // ---------------------------------------------------------------------------
@@ -1651,6 +1682,7 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
 
     if (!state || state === 'hidden') {
         badge.style.display = 'none';
+        badge.dataset.state = '';
         messageElement.textContent = '';
         clearPersistedAsyncAttachBadgeState();
         return;
@@ -1667,7 +1699,16 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
         else text = 'Async attach status';
     }
 
+    if ((normalized === 'queued' || normalized === 'running') && _chunkedUploadAsyncBadgeTransientSuppressed) {
+        return;
+    }
+
+    if (normalized === 'succeeded' || normalized === 'failed') {
+        _chunkedUploadAsyncBadgeTransientSuppressed = false;
+    }
+
     badge.style.display = 'flex';
+    badge.dataset.state = normalized;
     messageElement.textContent = text;
 
     if (normalized === 'queued') {
@@ -1850,6 +1891,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
     if (!file) return;
 
     // Starting a new upload should clear stale async attach status from prior flows.
+    _chunkedUploadAsyncBadgeTransientSuppressed = false;
     updateAsyncAttachBadge(null, 'hidden');
 
     const koViewModel = resolveUploadKoViewModel(contextElement);
