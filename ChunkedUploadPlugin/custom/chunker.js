@@ -602,6 +602,81 @@ async function cleanupChunkedUpload(pending) {
     }
 }
 
+async function startChunkedUploadAsyncAttach(pending, recordUri) {
+    const formData = createFormDataWithCsrf();
+    formData.append('SessionId', pending.sessionId || '');
+    formData.append('RecordUri', String(recordUri || 0));
+    formData.append('FileName', pending.originalFileName || '');
+    formData.append('FullUploadedFileName', pending.fullUploadedFileName || '');
+    formData.append('StagedFilePath', pending.stagedFilePath || '');
+    formData.append('NewRevision', String(pending.newRevision === true));
+    formData.append('KeepCheckedOut', String(pending.keepCheckedOut === true));
+    formData.append('Comments', pending.comments || '');
+
+    const res = await fetch(buildUploadRoute('attach/start'), {
+        method: 'POST',
+        credentials: 'include',
+        headers: JSON_ACCEPT_HEADERS,
+        body: formData
+    });
+
+    if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`Failed to start async attach (HTTP ${res.status})${body ? `: ${body.slice(0, 240)}` : ''}`);
+    }
+
+    return await res.json();
+}
+
+async function pollChunkedUploadAsyncAttach(jobId, timeoutMs) {
+    const started = Date.now();
+    const maxDuration = timeoutMs > 0 ? timeoutMs : (30 * 60 * 1000);
+
+    while ((Date.now() - started) < maxDuration) {
+        const res = await fetch(buildUploadRoute(`attach/${jobId}`), {
+            method: 'GET',
+            credentials: 'include',
+            headers: JSON_ACCEPT_HEADERS
+        });
+
+        if (!res.ok) {
+            const body = await res.text();
+            throw new Error(`Failed to query async attach status (HTTP ${res.status})${body ? `: ${body.slice(0, 240)}` : ''}`);
+        }
+
+        const status = await res.json();
+        if (status && status.Completed === true) {
+            return status;
+        }
+
+        await new Promise(function (resolve) { setTimeout(resolve, 2000); });
+    }
+
+    throw new Error('Timed out waiting for async attach completion.');
+}
+
+async function runChunkedUploadAsyncAttach(pending, recordUri) {
+    const start = await startChunkedUploadAsyncAttach(pending, recordUri);
+    if (!start || !start.JobId) {
+        throw new Error('Async attach start response did not include a JobId.');
+    }
+
+    logDebug(`[ChunkedUpload] Started async attach job ${start.JobId} for record ${recordUri}.`);
+    const status = await pollChunkedUploadAsyncAttach(start.JobId, 30 * 60 * 1000);
+    if (status && status.Succeeded === true) {
+        if (pending.expectedHash) {
+            await verifyDocumentHash(recordUri, pending.expectedHash);
+        }
+
+        await cleanupChunkedUpload(pending);
+        console.log(`[ChunkedUpload] Async attach completed for record ${recordUri}.`);
+        return;
+    }
+
+    const errorMessage = status && status.ErrorMessage ? status.ErrorMessage : 'Async attach did not complete successfully.';
+    throw new Error(errorMessage);
+}
+
 async function abortChunkedUploadSessionById(sessionId) {
     if (!sessionId) return;
 
@@ -713,6 +788,16 @@ async function abortChunkedUploadSessionById(sessionId) {
                         if (!pending) return;
 
                         unregisterPendingUpload(matchedKey, pending);
+
+                        if (pending.isLargeFilePilotCandidate === true) {
+                            try {
+                                await runChunkedUploadAsyncAttach(pending, uri);
+                            } catch (attachError) {
+                                console.error('[ChunkedUpload] Async attach failed:', attachError);
+                                alert(`Large-file async attach failed: ${attachError.message || attachError}`);
+                            }
+                            return;
+                        }
 
                         if (pending.expectedHash) {
                             await verifyDocumentHash(uri, pending.expectedHash);
@@ -1432,8 +1517,11 @@ function syncUploadWidgetProgressDom(koViewModel, percent) {
     }
 }
 
-function applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUploadedFileName) {
+function applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUploadedFileName, options) {
     if (!koViewModel || typeof ko === 'undefined') return false;
+
+    const effectiveOptions = options || {};
+    const deferNativeAttach = effectiveOptions.deferNativeAttach === true;
 
     const readyStatus =
         (typeof HP !== 'undefined' &&
@@ -1457,12 +1545,18 @@ function applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUpl
     }
 
     if (typeof koViewModel.uploadedFiles === 'function') {
-        koViewModel.uploadedFiles([{
-            FullUploadedFileName: fullUploadedFileName,
-            UploadedFileName: uploadedFileName,
-            OriginalFileName: '"' + file.name + '"',
-            FileStatus: ko.observable(readyStatus)
-        }]);
+        if (!deferNativeAttach) {
+            koViewModel.uploadedFiles([{
+                FullUploadedFileName: fullUploadedFileName,
+                UploadedFileName: uploadedFileName,
+                OriginalFileName: '"' + file.name + '"',
+                FileStatus: ko.observable(readyStatus)
+            }]);
+        } else {
+            // For large-file async attach pilot, keep UI state but avoid injecting
+            // the native upload token so CM save remains metadata-only.
+            koViewModel.uploadedFiles([]);
+        }
     }
 
     if (typeof koViewModel.uploadSuccessStatus === 'function') {
@@ -1565,6 +1659,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
 
         const uploadedFileName = result.RecordFilePath || result.StagedFilePath;
         const fullUploadedFileName = result.FullUploadedFileName || result.StagedFilePath;
+        const uiUploadedFileName = isLargeFilePilotCandidate ? '' : uploadedFileName;
 
         if (isLargeFilePilotCandidate) {
             logDebug(`Large-file pilot is active for ${file.name} (${file.size} bytes). Threshold=${resolveChunkedUploadLargeFilePilotThresholdMb()} MB.`);
@@ -1580,7 +1675,10 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
                 fileCacheKey: cancellationState.fileCacheKey || '',
                 originalFileName: file.name,
                 fileSize: file.size || 0,
-                isLargeFilePilotCandidate: isLargeFilePilotCandidate
+                isLargeFilePilotCandidate: isLargeFilePilotCandidate,
+                newRevision: checkInOptions.newRevision === true,
+                keepCheckedOut: checkInOptions.keepCheckedOut === true,
+                comments: checkInOptions.comments || ''
             }, file.name);
             logDebug('Registered pending post-save operations for:', uploadedFileName);
         }
@@ -1591,8 +1689,10 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
 
         // Mirror the native widget success state so the selected file remains visible
         // in the dialog after the chunked upload completes.
-        if (applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUploadedFileName)) {
-            logDebug('Injected staged path and visible success state into KO uploader. UploadedFileName:', uploadedFileName);
+        if (applySuccessfulUploadState(koViewModel, file, uiUploadedFileName, fullUploadedFileName, {
+            deferNativeAttach: isLargeFilePilotCandidate
+        })) {
+            logDebug('Injected staged path and visible success state into KO uploader. UploadedFileName:', uiUploadedFileName || '(deferred async attach)');
         } else {
             console.warn('Could not find KO ViewModel for uploader context; upload may not save correctly.');
         }

@@ -10,6 +10,40 @@ This project adds a custom Content Manager ServiceAPI plugin that supports resum
 - Reassembles the file server-side.
 - Checks the assembled file into the target Content Manager record.
 - Supports upload status queries and upload cancellation.
+- Includes a large-file async-attach pilot path in the Web Client script to recover from proxy timeouts on CM save calls.
+- Includes runtime debug logging controls for browser-side diagnostics.
+
+## Large-file async-attach pilot behavior
+
+The Web Client integration script now includes a pilot behavior for very large files.
+
+- Pilot threshold default: 1024 MB.
+- Files smaller than the threshold continue to use the normal flow.
+- Files at or above the threshold are flagged as pilot candidates.
+- If CM native save returns HTTP 504 or 524 after chunk upload has completed, the script:
+  - cleans up staged/session artifacts,
+  - shows a user-facing timeout recovery message,
+  - refreshes the page to clear the stuck spinner.
+
+This pilot is designed to improve reliability behind reverse proxies (for example Cloudflare) while preserving current behavior for smaller uploads.
+
+Runtime threshold controls in browser console:
+
+```javascript
+window.setChunkedUploadLargeFilePilotThresholdMb(1024);
+window.getChunkedUploadLargeFilePilotThresholdMb();
+```
+
+## Debug logging
+
+Browser-side debug logging can be enabled at runtime:
+
+```javascript
+window.setChunkedUploadVerbose(true);
+window.getChunkedUploadVerbose();
+```
+
+When enabled, the script writes verbose diagnostics to the browser console and shows a debug banner in the UI.
 
 ## Project layout
 

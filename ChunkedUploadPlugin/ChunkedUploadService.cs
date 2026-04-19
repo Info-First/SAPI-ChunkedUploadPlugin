@@ -4,9 +4,11 @@ using HP.HPTRIM.ServiceModel;
 using TRIM.SDK;
 using ServiceStack;
 using System;
+using System.Collections.Concurrent;
 using System.Configuration;
 using System.IO;
 using System.Linq;
+using System.Threading;
 
 namespace HP.HPTRIM.ServiceAPI
 {
@@ -90,6 +92,27 @@ namespace HP.HPTRIM.ServiceAPI
         public string SessionId { get; set; }
         public string StagedFilePath { get; set; }
         public string FullUploadedFileName { get; set; }
+    }
+
+    [Route("/Upload/attach/start", "POST")]
+    [Authenticate]
+    public class StartAsyncAttach : IReturn<StartAsyncAttachResponse>
+    {
+        public string SessionId { get; set; }
+        public long RecordUri { get; set; }
+        public string FileName { get; set; }
+        public string FullUploadedFileName { get; set; }
+        public string StagedFilePath { get; set; }
+        public bool? NewRevision { get; set; }
+        public bool? KeepCheckedOut { get; set; }
+        public string Comments { get; set; }
+    }
+
+    [Route("/Upload/attach/{JobId}", "GET")]
+    [Authenticate]
+    public class GetAsyncAttachStatus : IReturn<GetAsyncAttachStatusResponse>
+    {
+        public string JobId { get; set; }
     }
 
     public class ChunkedUploadSessionResponse : IHasResponseStatus
@@ -188,9 +211,35 @@ namespace HP.HPTRIM.ServiceAPI
         public ResponseStatus ResponseStatus { get; set; }
     }
 
+    public class StartAsyncAttachResponse : IHasResponseStatus
+    {
+        public string JobId { get; set; }
+        public string StatusUrl { get; set; }
+        public DateTime CreatedUtc { get; set; }
+        public ResponseStatus ResponseStatus { get; set; }
+    }
+
+    public class GetAsyncAttachStatusResponse : IHasResponseStatus
+    {
+        public string JobId { get; set; }
+        public long RecordUri { get; set; }
+        public string Status { get; set; }
+        public bool Completed { get; set; }
+        public bool Succeeded { get; set; }
+        public string ErrorMessage { get; set; }
+        public DateTime CreatedUtc { get; set; }
+        public DateTime UpdatedUtc { get; set; }
+        public DateTime? CompletedUtc { get; set; }
+        public ResponseStatus ResponseStatus { get; set; }
+    }
+
     public class ChunkedUploadService : TrimServiceBase
     {
         private static readonly ServiceStack.Logging.ILog Logger = ServiceStack.Logging.LogManager.GetLogger(typeof(ChunkedUploadService));
+        private static readonly ConcurrentDictionary<string, AsyncAttachJobState> AsyncAttachJobs = new ConcurrentDictionary<string, AsyncAttachJobState>(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan AsyncAttachJobRetention = TimeSpan.FromHours(6);
+        private static readonly int AsyncAttachMaxConcurrency = GetAsyncAttachMaxConcurrency();
+        private static readonly SemaphoreSlim AsyncAttachExecutionGate = new SemaphoreSlim(AsyncAttachMaxConcurrency, AsyncAttachMaxConcurrency);
         private readonly UploadSessionStore sessionStore = new UploadSessionStore();
 
         public object Post(StartChunkedUpload request)
@@ -475,11 +524,16 @@ namespace HP.HPTRIM.ServiceAPI
             var configured = ConfigurationManager.AppSettings["ChunkedUpload.CalculateTrimHash"];
             if (string.IsNullOrWhiteSpace(configured))
             {
-                return false;
+                return true;
             }
 
             bool enabled;
-            return bool.TryParse(configured, out enabled) && enabled;
+            if (!bool.TryParse(configured, out enabled))
+            {
+                return true;
+            }
+
+            return enabled;
         }
 
         public object Delete(AbortChunkedUpload request)
@@ -520,6 +574,95 @@ namespace HP.HPTRIM.ServiceAPI
                 SessionDeleted = sessionDeleted,
                 StagedFileDeleted = stagedDeleted,
                 NativeUploadFileDeleted = nativeDeleted
+            };
+        }
+
+        public object Post(StartAsyncAttach request)
+        {
+            if (request == null)
+            {
+                throw HttpError.BadRequest("Request body is required.");
+            }
+
+            if (request.RecordUri <= 0)
+            {
+                throw HttpError.BadRequest("RecordUri is required.");
+            }
+
+            if (string.IsNullOrWhiteSpace(request.SessionId))
+            {
+                throw HttpError.BadRequest("SessionId is required.");
+            }
+
+            var session = sessionStore.GetRequiredSession(request.SessionId);
+            var sourcePath = ResolveAsyncAttachSourcePath(request, session);
+            if (!File.Exists(sourcePath))
+            {
+                throw HttpError.NotFound("Async attach source file was not found.");
+            }
+
+            if (!IsPathUnderAllowedRoot(sourcePath, ResolveUploadBasePath()))
+            {
+                throw HttpError.Forbidden("Async attach source file is outside the allowed upload root.");
+            }
+
+            var job = new AsyncAttachJobState
+            {
+                JobId = Guid.NewGuid().ToString("N"),
+                SessionId = session.SessionId,
+                RecordUri = request.RecordUri,
+                DatabaseContext = Database,
+                FilePath = sourcePath,
+                FileName = string.IsNullOrWhiteSpace(request.FileName) ? session.FileName : request.FileName,
+                NewRevision = request.NewRevision ?? session.NewRevision,
+                KeepCheckedOut = request.KeepCheckedOut ?? session.KeepCheckedOut,
+                Comments = string.IsNullOrWhiteSpace(request.Comments) ? session.Comments : request.Comments,
+                Status = "Queued",
+                CreatedUtc = DateTime.UtcNow,
+                UpdatedUtc = DateTime.UtcNow
+            };
+
+            AsyncAttachJobs[job.JobId] = job;
+            CleanupExpiredAsyncAttachJobs();
+
+            ThreadPool.QueueUserWorkItem(_ => ExecuteAsyncAttachJob(job.JobId));
+
+            return new StartAsyncAttachResponse
+            {
+                JobId = job.JobId,
+                StatusUrl = Request.GetAbsoluteUrl(string.Format("~/Upload/attach/{0}", job.JobId)),
+                CreatedUtc = job.CreatedUtc,
+                ResponseStatus = new ResponseStatus()
+            };
+        }
+
+        public object Get(GetAsyncAttachStatus request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.JobId))
+            {
+                throw HttpError.BadRequest("JobId is required.");
+            }
+
+            CleanupExpiredAsyncAttachJobs();
+
+            AsyncAttachJobState job;
+            if (!AsyncAttachJobs.TryGetValue(request.JobId, out job))
+            {
+                throw HttpError.NotFound("Async attach job was not found.");
+            }
+
+            return new GetAsyncAttachStatusResponse
+            {
+                JobId = job.JobId,
+                RecordUri = job.RecordUri,
+                Status = job.Status,
+                Completed = job.Completed,
+                Succeeded = job.Succeeded,
+                ErrorMessage = job.ErrorMessage,
+                CreatedUtc = job.CreatedUtc,
+                UpdatedUtc = job.UpdatedUtc,
+                CompletedUtc = job.CompletedUtc,
+                ResponseStatus = new ResponseStatus()
             };
         }
 
@@ -652,5 +795,154 @@ namespace HP.HPTRIM.ServiceAPI
 
             return @"D:\Micro Focus Content Manager\ServiceAPIWorkpath\ChunkedUploads";
         }
+
+        private string ResolveAsyncAttachSourcePath(StartAsyncAttach request, UploadSessionState session)
+        {
+            if (!string.IsNullOrWhiteSpace(request.FullUploadedFileName))
+            {
+                return request.FullUploadedFileName;
+            }
+
+            if (!string.IsNullOrWhiteSpace(request.StagedFilePath))
+            {
+                return request.StagedFilePath;
+            }
+
+            var sessionDirectory = Path.Combine(ResolveChunkRootPath(), session.SessionId);
+            return Path.Combine(sessionDirectory, "assembled.bin");
+        }
+
+        private static void ExecuteAsyncAttachJob(string jobId)
+        {
+            AsyncAttachJobState job;
+            if (!AsyncAttachJobs.TryGetValue(jobId, out job))
+            {
+                return;
+            }
+
+            job.Status = "Running";
+            job.UpdatedUtc = DateTime.UtcNow;
+
+            try
+            {
+                AsyncAttachExecutionGate.Wait();
+                try
+                {
+                    // Run the long-running attach in a background worker so the client does not
+                    // hold a proxy-limited HTTP request open.
+                    // NOTE: this uses the same SDK/database context provided by the host process.
+                    var db = job.DatabaseContext;
+                    if (db == null)
+                    {
+                        throw new InvalidOperationException("Database context was not available for async attach.");
+                    }
+
+                    var record = new TRIM.SDK.Record(db, job.RecordUri);
+                    if (record.Uri <= 0)
+                    {
+                        throw HttpError.NotFound("Record not found.");
+                    }
+
+                    var attachName = string.IsNullOrWhiteSpace(job.FileName)
+                        ? Path.GetFileName(job.FilePath)
+                        : Path.GetFileName(job.FileName);
+
+                    var inputDocument = new TRIM.SDK.InputDocument(job.FilePath)
+                    {
+                        CheckinAs = attachName
+                    };
+
+                    var comments = string.IsNullOrWhiteSpace(job.Comments)
+                        ? "Uploaded via ChunkedUploadPlugin (async attach)"
+                        : job.Comments;
+
+                    record.SetDocument(inputDocument, job.NewRevision, job.KeepCheckedOut, comments);
+                    record.Save();
+                }
+                finally
+                {
+                    AsyncAttachExecutionGate.Release();
+                }
+
+                job.Status = "Succeeded";
+                job.Succeeded = true;
+                job.Completed = true;
+                job.CompletedUtc = DateTime.UtcNow;
+                job.UpdatedUtc = DateTime.UtcNow;
+            }
+            catch (Exception ex)
+            {
+                job.Status = "Failed";
+                job.Succeeded = false;
+                job.Completed = true;
+                job.CompletedUtc = DateTime.UtcNow;
+                job.UpdatedUtc = DateTime.UtcNow;
+                job.ErrorMessage = ex.Message;
+                Logger.Error($"[AsyncAttach] Job {job.JobId} failed: {ex}");
+            }
+        }
+
+        private static void CleanupExpiredAsyncAttachJobs()
+        {
+            var now = DateTime.UtcNow;
+            var expired = AsyncAttachJobs
+                .Where(kvp => kvp.Value.Completed && kvp.Value.CompletedUtc.HasValue && (now - kvp.Value.CompletedUtc.Value) > AsyncAttachJobRetention)
+                .Select(kvp => kvp.Key)
+                .ToList();
+
+            foreach (var key in expired)
+            {
+                AsyncAttachJobState removed;
+                AsyncAttachJobs.TryRemove(key, out removed);
+            }
+        }
+
+        private static int GetAsyncAttachMaxConcurrency()
+        {
+            int configured;
+            if (int.TryParse(ConfigurationManager.AppSettings["ChunkedUpload.AsyncAttachMaxConcurrency"], out configured) && configured > 0)
+            {
+                return configured;
+            }
+
+            // Allow parallel async attach jobs by default while avoiding unbounded
+            // resource pressure on the CM SDK host process.
+            return 2;
+        }
+
+        private static bool IsPathUnderAllowedRoot(string filePath, string allowedRoot)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(allowedRoot))
+            {
+                return false;
+            }
+
+            var fullPath = Path.GetFullPath(filePath);
+            var fullAllowedRoot = Path.GetFullPath(allowedRoot)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+
+            return fullPath.StartsWith(fullAllowedRoot, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    internal sealed class AsyncAttachJobState
+    {
+        public string JobId { get; set; }
+        public string SessionId { get; set; }
+        public long RecordUri { get; set; }
+        public TRIM.SDK.Database DatabaseContext { get; set; }
+        public string FilePath { get; set; }
+        public string FileName { get; set; }
+        public bool NewRevision { get; set; }
+        public bool KeepCheckedOut { get; set; }
+        public string Comments { get; set; }
+        public string Status { get; set; }
+        public bool Completed { get; set; }
+        public bool Succeeded { get; set; }
+        public string ErrorMessage { get; set; }
+        public DateTime CreatedUtc { get; set; }
+        public DateTime UpdatedUtc { get; set; }
+        public DateTime? CompletedUtc { get; set; }
     }
 }
