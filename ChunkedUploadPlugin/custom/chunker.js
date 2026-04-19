@@ -1,5 +1,10 @@
 const CHUNKED_UPLOAD_VERBOSE_STORAGE_KEY = 'cm_chunked_upload_verbose';
 const CHUNKED_UPLOAD_DEBUG_BANNER_ID = 'cm-chunked-upload-debug-banner';
+const CHUNKED_UPLOAD_ASYNC_BADGE_ID = 'cm-chunked-upload-async-attach-badge';
+const CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID = 'cm-chunked-upload-async-attach-badge-text';
+const CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY = 'cm_chunked_upload_async_attach_badge';
+const CHUNKED_UPLOAD_ASYNC_BADGE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const CHUNKED_UPLOAD_ASYNC_BADGE_AUTO_DISMISS_MS = 5000;
 const SERVICE_API_BASE_URL = '/contentmanager/serviceapi';
 const JSON_ACCEPT_HEADERS = { 'Accept': 'application/json' };
 const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload').replace(/^\/+|\/+$/g, '');
@@ -14,6 +19,7 @@ const CHUNKED_UPLOAD_SESSION_ID_REGEX = /^[a-z0-9]{32}$/i;
 
 let CHUNKED_UPLOAD_VERBOSE = false;
 let _chunkedUploadLargeFileTimeoutRecoveryShown = false;
+let _chunkedUploadAsyncBadgeAutoDismissTimer = null;
 
 let _chunkedUploadResumeSweepPromise = null;
 
@@ -174,6 +180,7 @@ function updateChunkedUploadDebugBanner() {
     const message = banner.querySelector('#cm-chunked-upload-debug-banner-message');
     if (!CHUNKED_UPLOAD_VERBOSE) {
         banner.style.display = 'none';
+        syncAsyncAttachBadgeBottomOffset();
         return;
     }
 
@@ -181,6 +188,7 @@ function updateChunkedUploadDebugBanner() {
         message.textContent = 'Chunked Upload debug mode is ON. Verbose browser logging and diagnostic helpers are enabled.';
     }
     banner.style.display = 'flex';
+    syncAsyncAttachBadgeBottomOffset();
 }
 
 window.setChunkedUploadVerbose = function (value) {
@@ -208,6 +216,123 @@ function installChunkedUploadDebugBanner() {
     }
 
     updateChunkedUploadDebugBanner();
+}
+
+function resolveAsyncAttachBadgeBottomOffsetPx() {
+    const debugBanner = document.getElementById(CHUNKED_UPLOAD_DEBUG_BANNER_ID);
+    if (debugBanner && debugBanner.style.display !== 'none' && debugBanner.offsetHeight > 0) {
+        return debugBanner.offsetHeight + 8;
+    }
+
+    return 12;
+}
+
+function syncAsyncAttachBadgeBottomOffset() {
+    const badge = document.getElementById(CHUNKED_UPLOAD_ASYNC_BADGE_ID);
+    if (!badge) return;
+    badge.style.bottom = `${resolveAsyncAttachBadgeBottomOffsetPx()}px`;
+}
+
+function persistAsyncAttachBadgeState(state, message) {
+    try {
+        sessionStorage.setItem(CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY, JSON.stringify({
+            state: String(state || ''),
+            message: String(message || ''),
+            updatedUtc: Date.now()
+        }));
+    } catch (e) {
+        // Ignore session storage write issues.
+    }
+}
+
+function clearPersistedAsyncAttachBadgeState() {
+    try {
+        sessionStorage.removeItem(CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY);
+    } catch (e) {
+        // Ignore session storage delete issues.
+    }
+}
+
+function readPersistedAsyncAttachBadgeState() {
+    try {
+        const raw = sessionStorage.getItem(CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || !parsed.state) return null;
+        const age = Date.now() - Number(parsed.updatedUtc || 0);
+        if (!Number.isFinite(age) || age < 0 || age > CHUNKED_UPLOAD_ASYNC_BADGE_MAX_AGE_MS) {
+            clearPersistedAsyncAttachBadgeState();
+            return null;
+        }
+        return parsed;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getOrCreateAsyncAttachBadge() {
+    if (!document.body) return null;
+
+    let badge = document.getElementById(CHUNKED_UPLOAD_ASYNC_BADGE_ID);
+    if (badge) return badge;
+
+    badge = document.createElement('div');
+    badge.id = CHUNKED_UPLOAD_ASYNC_BADGE_ID;
+    badge.style.cssText = [
+        'display:none',
+        'position:fixed',
+        'left:16px',
+        'right:auto',
+        'width:min(460px, calc(100vw - 32px))',
+        'z-index:100001',
+        'border-radius:12px',
+        'padding:10px 14px',
+        'font-size:13px',
+        'font-weight:600',
+        'line-height:1.35',
+        'box-shadow:0 2px 10px rgba(0,0,0,0.08)',
+        'display:flex',
+        'align-items:center',
+        'justify-content:space-between',
+        'gap:12px'
+    ].join(';');
+
+    const text = document.createElement('div');
+    text.id = CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID;
+    text.style.cssText = 'min-width:0;word-break:break-word;';
+    badge.appendChild(text);
+
+    const dismissButton = document.createElement('button');
+    dismissButton.type = 'button';
+    dismissButton.className = 'btn btn-flat btn-secondary';
+    dismissButton.textContent = 'Dismiss';
+    dismissButton.style.cssText = 'white-space:nowrap;padding:4px 10px;';
+    dismissButton.onclick = function () {
+        updateAsyncAttachBadge(null, 'hidden');
+    };
+    badge.appendChild(dismissButton);
+
+    document.body.appendChild(badge);
+    syncAsyncAttachBadgeBottomOffset();
+    return badge;
+}
+
+function restoreAsyncAttachBadgeFromSession() {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', restoreAsyncAttachBadgeFromSession, { once: true });
+        return;
+    }
+
+    const persisted = readPersistedAsyncAttachBadgeState();
+    if (!persisted) return;
+
+    const restoredState = String(persisted.state || '').toLowerCase();
+    if (restoredState === 'queued' || restoredState === 'running') {
+        clearPersistedAsyncAttachBadgeState();
+        return;
+    }
+
+    updateAsyncAttachBadge(null, persisted.state, persisted.message);
 }
 
 function logDebug() {
@@ -376,6 +501,8 @@ function getChunkedUploadProgressMessage(percent, isResuming) {
 
 logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
 installChunkedUploadDebugBanner();
+restoreAsyncAttachBadgeFromSession();
+window.addEventListener('resize', syncAsyncAttachBadgeBottomOffset);
 void ensureChunkedUploadResumeSweep();
 
 // ---------------------------------------------------------------------------
@@ -1511,45 +1638,21 @@ function resolveUploadKoViewModel(sourceElement) {
     return null;
 }
 
-function resolveAsyncAttachBadgeHostById(koViewModelId) {
-    if (!koViewModelId) return null;
-    return document.getElementById(koViewModelId);
-}
-
-function getOrCreateAsyncAttachBadge(koViewModelId) {
-    const host = resolveAsyncAttachBadgeHostById(koViewModelId);
-    if (!host) return null;
-
-    let badge = host.querySelector('.cm-chunked-async-attach-badge');
-    if (badge) return badge;
-
-    badge = document.createElement('div');
-    badge.className = 'cm-chunked-async-attach-badge';
-    badge.style.cssText = [
-        'display:none',
-        'margin:8px 0 10px 0',
-        'padding:6px 10px',
-        'border-radius:12px',
-        'font-size:12px',
-        'font-weight:600',
-        'line-height:1.3',
-        'width:max-content',
-        'max-width:100%',
-        'word-break:break-word'
-    ].join(';');
-
-    const panelBody = host.querySelector('.panel-body') || host;
-    panelBody.insertBefore(badge, panelBody.firstChild);
-    return badge;
-}
-
 function updateAsyncAttachBadge(koViewModelId, state, detailText) {
-    const badge = getOrCreateAsyncAttachBadge(koViewModelId);
+    const badge = getOrCreateAsyncAttachBadge();
     if (!badge) return;
+
+    const messageElement = badge.querySelector(`#${CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID}`) || badge;
+
+    if (_chunkedUploadAsyncBadgeAutoDismissTimer) {
+        clearTimeout(_chunkedUploadAsyncBadgeAutoDismissTimer);
+        _chunkedUploadAsyncBadgeAutoDismissTimer = null;
+    }
 
     if (!state || state === 'hidden') {
         badge.style.display = 'none';
-        badge.textContent = '';
+        messageElement.textContent = '';
+        clearPersistedAsyncAttachBadgeState();
         return;
     }
 
@@ -1564,8 +1667,8 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
         else text = 'Async attach status';
     }
 
-    badge.style.display = 'inline-block';
-    badge.textContent = text;
+    badge.style.display = 'flex';
+    messageElement.textContent = text;
 
     if (normalized === 'queued') {
         badge.style.background = '#e8f1ff';
@@ -1588,11 +1691,19 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
         badge.style.color = '#2f3a46';
         badge.style.border = '1px solid #d5dbe1';
     }
+
+    persistAsyncAttachBadgeState(normalized, text);
+    syncAsyncAttachBadgeBottomOffset();
+
+    if (normalized === 'succeeded') {
+        _chunkedUploadAsyncBadgeAutoDismissTimer = setTimeout(function () {
+            updateAsyncAttachBadge(null, 'hidden');
+        }, CHUNKED_UPLOAD_ASYNC_BADGE_AUTO_DISMISS_MS);
+    }
 }
 
 function updateAsyncAttachBadgeForPending(pending, state, detailText) {
-    if (!pending || !pending.asyncAttachBadgeTargetId) return;
-    updateAsyncAttachBadge(pending.asyncAttachBadgeTargetId, state, detailText);
+    updateAsyncAttachBadge(null, state, detailText);
 }
 
 function syncUploadWidgetProgressDom(koViewModel, percent) {
@@ -1738,6 +1849,9 @@ const handleChunkedUploadDeleteConfirmCancelClick = function (event) {
 async function processChunkedUploadFile(file, contextElement, clearInputElement) {
     if (!file) return;
 
+    // Starting a new upload should clear stale async attach status from prior flows.
+    updateAsyncAttachBadge(null, 'hidden');
+
     const koViewModel = resolveUploadKoViewModel(contextElement);
     const checkInOptions = resolveCheckInOptionsFromContext(contextElement);
     const isLargeFilePilotCandidate = isChunkedUploadLargeFilePilotCandidate(file.size);
@@ -1784,8 +1898,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
                 isLargeFilePilotCandidate: isLargeFilePilotCandidate,
                 newRevision: checkInOptions.newRevision === true,
                 keepCheckedOut: checkInOptions.keepCheckedOut === true,
-                comments: checkInOptions.comments || '',
-                asyncAttachBadgeTargetId: koViewModel && koViewModel.id ? koViewModel.id : ''
+                comments: checkInOptions.comments || ''
             }, file.name);
             logDebug('Registered pending post-save operations for:', uploadedFileName);
         }
@@ -1801,7 +1914,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
         })) {
             logDebug('Injected staged path and visible success state into KO uploader. UploadedFileName:', uiUploadedFileName || '(deferred async attach)');
             if (isLargeFilePilotCandidate) {
-                updateAsyncAttachBadge(koViewModel && koViewModel.id, 'queued');
+                updateAsyncAttachBadge(null, 'queued');
             }
         } else {
             console.warn('Could not find KO ViewModel for uploader context; upload may not save correctly.');
