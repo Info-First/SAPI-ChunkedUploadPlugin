@@ -628,7 +628,7 @@ async function startChunkedUploadAsyncAttach(pending, recordUri) {
     return await res.json();
 }
 
-async function pollChunkedUploadAsyncAttach(jobId, timeoutMs) {
+async function pollChunkedUploadAsyncAttach(jobId, timeoutMs, onStatus) {
     const started = Date.now();
     const maxDuration = timeoutMs > 0 ? timeoutMs : (30 * 60 * 1000);
 
@@ -645,6 +645,9 @@ async function pollChunkedUploadAsyncAttach(jobId, timeoutMs) {
         }
 
         const status = await res.json();
+        if (typeof onStatus === 'function') {
+            onStatus(status);
+        }
         if (status && status.Completed === true) {
             return status;
         }
@@ -656,14 +659,27 @@ async function pollChunkedUploadAsyncAttach(jobId, timeoutMs) {
 }
 
 async function runChunkedUploadAsyncAttach(pending, recordUri) {
+    updateAsyncAttachBadgeForPending(pending, 'running');
+
     const start = await startChunkedUploadAsyncAttach(pending, recordUri);
     if (!start || !start.JobId) {
+        updateAsyncAttachBadgeForPending(pending, 'failed', 'Async attach failed to start');
         throw new Error('Async attach start response did not include a JobId.');
     }
 
     logDebug(`[ChunkedUpload] Started async attach job ${start.JobId} for record ${recordUri}.`);
-    const status = await pollChunkedUploadAsyncAttach(start.JobId, 30 * 60 * 1000);
+    const status = await pollChunkedUploadAsyncAttach(start.JobId, 30 * 60 * 1000, function (nextStatus) {
+        if (!nextStatus) return;
+        const state = String(nextStatus.Status || '').toLowerCase();
+        if (state === 'queued') {
+            updateAsyncAttachBadgeForPending(pending, 'queued');
+        } else if (state === 'running') {
+            updateAsyncAttachBadgeForPending(pending, 'running');
+        }
+    });
     if (status && status.Succeeded === true) {
+        updateAsyncAttachBadgeForPending(pending, 'succeeded');
+
         if (pending.expectedHash) {
             await verifyDocumentHash(recordUri, pending.expectedHash);
         }
@@ -674,6 +690,7 @@ async function runChunkedUploadAsyncAttach(pending, recordUri) {
     }
 
     const errorMessage = status && status.ErrorMessage ? status.ErrorMessage : 'Async attach did not complete successfully.';
+    updateAsyncAttachBadgeForPending(pending, 'failed', `Async attach failed: ${errorMessage}`);
     throw new Error(errorMessage);
 }
 
@@ -1494,6 +1511,90 @@ function resolveUploadKoViewModel(sourceElement) {
     return null;
 }
 
+function resolveAsyncAttachBadgeHostById(koViewModelId) {
+    if (!koViewModelId) return null;
+    return document.getElementById(koViewModelId);
+}
+
+function getOrCreateAsyncAttachBadge(koViewModelId) {
+    const host = resolveAsyncAttachBadgeHostById(koViewModelId);
+    if (!host) return null;
+
+    let badge = host.querySelector('.cm-chunked-async-attach-badge');
+    if (badge) return badge;
+
+    badge = document.createElement('div');
+    badge.className = 'cm-chunked-async-attach-badge';
+    badge.style.cssText = [
+        'display:none',
+        'margin:8px 0 10px 0',
+        'padding:6px 10px',
+        'border-radius:12px',
+        'font-size:12px',
+        'font-weight:600',
+        'line-height:1.3',
+        'width:max-content',
+        'max-width:100%',
+        'word-break:break-word'
+    ].join(';');
+
+    const panelBody = host.querySelector('.panel-body') || host;
+    panelBody.insertBefore(badge, panelBody.firstChild);
+    return badge;
+}
+
+function updateAsyncAttachBadge(koViewModelId, state, detailText) {
+    const badge = getOrCreateAsyncAttachBadge(koViewModelId);
+    if (!badge) return;
+
+    if (!state || state === 'hidden') {
+        badge.style.display = 'none';
+        badge.textContent = '';
+        return;
+    }
+
+    const normalized = String(state || '').toLowerCase();
+    let text = detailText || '';
+
+    if (!text) {
+        if (normalized === 'queued') text = 'Async attach queued';
+        else if (normalized === 'running') text = 'Async attach in progress';
+        else if (normalized === 'succeeded') text = 'Async attach completed';
+        else if (normalized === 'failed') text = 'Async attach failed';
+        else text = 'Async attach status';
+    }
+
+    badge.style.display = 'inline-block';
+    badge.textContent = text;
+
+    if (normalized === 'queued') {
+        badge.style.background = '#e8f1ff';
+        badge.style.color = '#0f4c81';
+        badge.style.border = '1px solid #c6dcff';
+    } else if (normalized === 'running') {
+        badge.style.background = '#fff4d6';
+        badge.style.color = '#6b4a00';
+        badge.style.border = '1px solid #f2d08f';
+    } else if (normalized === 'succeeded') {
+        badge.style.background = '#e6f6ea';
+        badge.style.color = '#0f5132';
+        badge.style.border = '1px solid #b7e4c7';
+    } else if (normalized === 'failed') {
+        badge.style.background = '#fbeaea';
+        badge.style.color = '#7a1f1f';
+        badge.style.border = '1px solid #f1b5b5';
+    } else {
+        badge.style.background = '#eef0f2';
+        badge.style.color = '#2f3a46';
+        badge.style.border = '1px solid #d5dbe1';
+    }
+}
+
+function updateAsyncAttachBadgeForPending(pending, state, detailText) {
+    if (!pending || !pending.asyncAttachBadgeTargetId) return;
+    updateAsyncAttachBadge(pending.asyncAttachBadgeTargetId, state, detailText);
+}
+
 function syncUploadWidgetProgressDom(koViewModel, percent) {
     if (!koViewModel || !koViewModel.id) return;
 
@@ -1553,9 +1654,14 @@ function applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUpl
                 FileStatus: ko.observable(readyStatus)
             }]);
         } else {
-            // For large-file async attach pilot, keep UI state but avoid injecting
-            // the native upload token so CM save remains metadata-only.
-            koViewModel.uploadedFiles([]);
+            // For large-file async attach pilot, keep a visible row in the uploader
+            // but avoid injecting a native upload token so save remains metadata-only.
+            koViewModel.uploadedFiles([{
+                FullUploadedFileName: '',
+                UploadedFileName: '',
+                OriginalFileName: '"' + file.name + '"',
+                FileStatus: ko.observable(readyStatus)
+            }]);
         }
     }
 
@@ -1678,7 +1784,8 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
                 isLargeFilePilotCandidate: isLargeFilePilotCandidate,
                 newRevision: checkInOptions.newRevision === true,
                 keepCheckedOut: checkInOptions.keepCheckedOut === true,
-                comments: checkInOptions.comments || ''
+                comments: checkInOptions.comments || '',
+                asyncAttachBadgeTargetId: koViewModel && koViewModel.id ? koViewModel.id : ''
             }, file.name);
             logDebug('Registered pending post-save operations for:', uploadedFileName);
         }
@@ -1693,6 +1800,9 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
             deferNativeAttach: isLargeFilePilotCandidate
         })) {
             logDebug('Injected staged path and visible success state into KO uploader. UploadedFileName:', uiUploadedFileName || '(deferred async attach)');
+            if (isLargeFilePilotCandidate) {
+                updateAsyncAttachBadge(koViewModel && koViewModel.id, 'queued');
+            }
         } else {
             console.warn('Could not find KO ViewModel for uploader context; upload may not save correctly.');
         }

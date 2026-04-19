@@ -8,6 +8,7 @@ using System.Collections.Concurrent;
 using System.Configuration;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 
 namespace HP.HPTRIM.ServiceAPI
@@ -611,7 +612,9 @@ namespace HP.HPTRIM.ServiceAPI
                 JobId = Guid.NewGuid().ToString("N"),
                 SessionId = session.SessionId,
                 RecordUri = request.RecordUri,
-                DatabaseContext = Database,
+                DatabaseId = TryGetDatabaseStringProperty(Database, "Id"),
+                WorkgroupServerName = TryGetDatabaseStringProperty(Database, "WorkgroupServerName"),
+                TrustedUser = TryGetDatabaseStringProperty(Database, "TrustedUser"),
                 FilePath = sourcePath,
                 FileName = string.IsNullOrWhiteSpace(request.FileName) ? session.FileName : request.FileName,
                 NewRevision = request.NewRevision ?? session.NewRevision,
@@ -830,34 +833,32 @@ namespace HP.HPTRIM.ServiceAPI
                 {
                     // Run the long-running attach in a background worker so the client does not
                     // hold a proxy-limited HTTP request open.
-                    // NOTE: this uses the same SDK/database context provided by the host process.
-                    var db = job.DatabaseContext;
-                    if (db == null)
+                    // Use a fresh SDK Database per async job instead of carrying
+                    // request-scoped Database instances across thread boundaries.
+                    using (var db = CreateAsyncAttachDatabase(job))
                     {
-                        throw new InvalidOperationException("Database context was not available for async attach.");
+                        var record = new TRIM.SDK.Record(db, job.RecordUri);
+                        if (record.Uri <= 0)
+                        {
+                            throw HttpError.NotFound("Record not found.");
+                        }
+
+                        var attachName = string.IsNullOrWhiteSpace(job.FileName)
+                            ? Path.GetFileName(job.FilePath)
+                            : Path.GetFileName(job.FileName);
+
+                        var inputDocument = new TRIM.SDK.InputDocument(job.FilePath)
+                        {
+                            CheckinAs = attachName
+                        };
+
+                        var comments = string.IsNullOrWhiteSpace(job.Comments)
+                            ? "Uploaded via ChunkedUploadPlugin (async attach)"
+                            : job.Comments;
+
+                        record.SetDocument(inputDocument, job.NewRevision, job.KeepCheckedOut, comments);
+                        record.Save();
                     }
-
-                    var record = new TRIM.SDK.Record(db, job.RecordUri);
-                    if (record.Uri <= 0)
-                    {
-                        throw HttpError.NotFound("Record not found.");
-                    }
-
-                    var attachName = string.IsNullOrWhiteSpace(job.FileName)
-                        ? Path.GetFileName(job.FilePath)
-                        : Path.GetFileName(job.FileName);
-
-                    var inputDocument = new TRIM.SDK.InputDocument(job.FilePath)
-                    {
-                        CheckinAs = attachName
-                    };
-
-                    var comments = string.IsNullOrWhiteSpace(job.Comments)
-                        ? "Uploaded via ChunkedUploadPlugin (async attach)"
-                        : job.Comments;
-
-                    record.SetDocument(inputDocument, job.NewRevision, job.KeepCheckedOut, comments);
-                    record.Save();
                 }
                 finally
                 {
@@ -910,6 +911,70 @@ namespace HP.HPTRIM.ServiceAPI
             return 2;
         }
 
+        private static TRIM.SDK.Database CreateAsyncAttachDatabase(AsyncAttachJobState job)
+        {
+            var db = new TRIM.SDK.Database();
+
+            TrySetDatabaseStringProperty(db, "Id", job.DatabaseId);
+            TrySetDatabaseStringProperty(db, "WorkgroupServerName", job.WorkgroupServerName);
+            TrySetDatabaseStringProperty(db, "TrustedUser", job.TrustedUser);
+
+            var connectMethod = db.GetType().GetMethod("Connect", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+            if (connectMethod != null)
+            {
+                connectMethod.Invoke(db, null);
+            }
+
+            return db;
+        }
+
+        private static string TryGetDatabaseStringProperty(object database, string propertyName)
+        {
+            if (database == null || string.IsNullOrWhiteSpace(propertyName))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                var property = database.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+                if (property == null || !property.CanRead)
+                {
+                    return string.Empty;
+                }
+
+                var value = property.GetValue(database, null);
+                return value == null ? string.Empty : Convert.ToString(value);
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static void TrySetDatabaseStringProperty(object database, string propertyName, string value)
+        {
+            if (database == null || string.IsNullOrWhiteSpace(propertyName) || string.IsNullOrWhiteSpace(value))
+            {
+                return;
+            }
+
+            try
+            {
+                var property = database.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+                if (property == null || !property.CanWrite)
+                {
+                    return;
+                }
+
+                property.SetValue(database, value, null);
+            }
+            catch
+            {
+                // Ignore assignment issues and allow SDK defaults.
+            }
+        }
+
         private static bool IsPathUnderAllowedRoot(string filePath, string allowedRoot)
         {
             if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(allowedRoot))
@@ -931,7 +996,9 @@ namespace HP.HPTRIM.ServiceAPI
         public string JobId { get; set; }
         public string SessionId { get; set; }
         public long RecordUri { get; set; }
-        public TRIM.SDK.Database DatabaseContext { get; set; }
+        public string DatabaseId { get; set; }
+        public string WorkgroupServerName { get; set; }
+        public string TrustedUser { get; set; }
         public string FilePath { get; set; }
         public string FileName { get; set; }
         public bool NewRevision { get; set; }
