@@ -1670,10 +1670,38 @@ const handleChunkedUploadFileChange = async function(event) {
 function resolveUploadKoViewModel(sourceElement) {
     if (typeof ko === 'undefined' || !sourceElement) return null;
 
+    const resolveFromBindingContext = function (element) {
+        if (!ko.contextFor || !element) return null;
+
+        let context = null;
+        try {
+            context = ko.contextFor(element);
+        } catch (e) {
+            return null;
+        }
+
+        let safety = 0;
+        while (context && safety < 16) {
+            const data = context.$data;
+            if (data && typeof data.uploadedFiles === 'function') {
+                return data;
+            }
+            context = context.$parentContext;
+            safety++;
+        }
+
+        return null;
+    };
+
     // In some CM dialogs (including Check In), KO bindings may live on a parent container.
     let current = sourceElement;
     let depth = 0;
     while (current && depth < 12) {
+        const contextVm = resolveFromBindingContext(current);
+        if (contextVm) {
+            return contextVm;
+        }
+
         const vm = ko.dataFor(current);
         if (vm && typeof vm.uploadedFiles === 'function') {
             return vm;
@@ -1730,9 +1758,9 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
     let text = detailText || '';
 
     if (!text) {
-        if (normalized === 'queued') text = 'Async attach queued';
-        else if (normalized === 'running') text = 'Async attach in progress';
-        else if (normalized === 'succeeded') text = 'Async attach completed';
+        if (normalized === 'queued') text = 'Background file upload queued';
+        else if (normalized === 'running') text = 'Background file upload in progress';
+        else if (normalized === 'succeeded') text = 'Background file upload complete';
         else if (normalized === 'failed') text = 'Async attach failed';
         else text = 'Async attach status';
     }
@@ -1908,6 +1936,9 @@ const handleChunkedUploadDeleteConfirmOkClick = function (event) {
 
     if (!okButton) return;
 
+    _chunkedUploadAsyncBadgeTransientSuppressed = false;
+    updateAsyncAttachBadge(null, 'hidden');
+
     const originalFileNames = consumePendingChunkedUploadDeleteConfirmation();
     if (!originalFileNames.length) return;
 
@@ -1923,6 +1954,8 @@ const handleChunkedUploadDeleteConfirmCancelClick = function (event) {
 
     if (!cancelButton) return;
     clearPendingChunkedUploadDeleteConfirmation();
+    _chunkedUploadAsyncBadgeTransientSuppressed = false;
+    updateAsyncAttachBadge(null, 'hidden');
 };
 
 function isChunkedUploadNativePostFormDataUrl(rawUrl) {
@@ -2248,7 +2281,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
         })) {
             logDebug('Injected staged path and visible success state into KO uploader. UploadedFileName:', uiUploadedFileName || '(deferred async attach)');
         } else {
-            console.warn('Could not find KO ViewModel for uploader context; upload may not save correctly.');
+            logDebug('Could not find KO ViewModel for uploader context; upload may rely on native form state.');
         }
 
         hideChunkedUploadProgressMessageDom();
