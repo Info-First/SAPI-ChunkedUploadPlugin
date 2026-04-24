@@ -21,6 +21,7 @@ let CHUNKED_UPLOAD_VERBOSE = false;
 let _chunkedUploadLargeFileTimeoutRecoveryShown = false;
 let _chunkedUploadAsyncBadgeAutoDismissTimer = null;
 let _chunkedUploadAsyncBadgeTransientSuppressed = false;
+let _chunkedUploadAsyncBadgeRunningDots = 0;
 
 let _chunkedUploadResumeSweepPromise = null;
 const _chunkedUploadRecentNativeIntercepts = {};
@@ -1759,10 +1760,17 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
 
     if (!text) {
         if (normalized === 'queued') text = 'Background file upload queued';
-        else if (normalized === 'running') text = 'Background file upload in progress';
+        else if (normalized === 'running') {
+            _chunkedUploadAsyncBadgeRunningDots = (_chunkedUploadAsyncBadgeRunningDots % 3) + 1;
+            text = `Background file upload in progress${'.'.repeat(_chunkedUploadAsyncBadgeRunningDots)}`;
+        }
         else if (normalized === 'succeeded') text = 'Background file upload complete';
         else if (normalized === 'failed') text = 'Async attach failed';
         else text = 'Async attach status';
+    }
+
+    if (normalized !== 'running') {
+        _chunkedUploadAsyncBadgeRunningDots = 0;
     }
 
     if ((normalized === 'queued' || normalized === 'running') && _chunkedUploadAsyncBadgeTransientSuppressed) {
