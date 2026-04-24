@@ -2,6 +2,7 @@ const CHUNKED_UPLOAD_VERBOSE_STORAGE_KEY = 'cm_chunked_upload_verbose';
 const CHUNKED_UPLOAD_DEBUG_BANNER_ID = 'cm-chunked-upload-debug-banner';
 const CHUNKED_UPLOAD_ASYNC_BADGE_ID = 'cm-chunked-upload-async-attach-badge';
 const CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID = 'cm-chunked-upload-async-attach-badge-text';
+const CHUNKED_UPLOAD_ASYNC_BADGE_RETRY_ID = 'cm-chunked-upload-async-attach-badge-retry';
 const CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY = 'cm_chunked_upload_async_attach_badge';
 const CHUNKED_UPLOAD_ASYNC_BADGE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 const CHUNKED_UPLOAD_ASYNC_BADGE_AUTO_DISMISS_MS = 5000;
@@ -22,11 +23,16 @@ let _chunkedUploadLargeFileTimeoutRecoveryShown = false;
 let _chunkedUploadAsyncBadgeAutoDismissTimer = null;
 let _chunkedUploadAsyncBadgeTransientSuppressed = false;
 let _chunkedUploadAsyncBadgeRunningDots = 0;
+let _chunkedUploadAsyncAttachRetryContext = null;
+let _chunkedUploadAsyncAttachRetryInProgress = false;
 
 let _chunkedUploadResumeSweepPromise = null;
 const _chunkedUploadRecentNativeIntercepts = {};
 const _chunkedUploadActiveFileKeys = {};
 let _chunkedUploadLastContextElement = null;
+let _chunkedUploadPendingSuggestedTitle = '';
+let _chunkedUploadPendingTitleContextElement = null;
+let _chunkedUploadPendingTitleSetAtUtc = 0;
 
 function clampChunkedUploadConcurrency(value) {
     const parsed = parseInt(value, 10);
@@ -300,6 +306,84 @@ function readPersistedAsyncAttachBadgeState() {
     }
 }
 
+function setChunkedUploadAsyncAttachRetryContext(pending, recordUri) {
+    if (!pending || !recordUri || recordUri <= 0) {
+        return;
+    }
+
+    _chunkedUploadAsyncAttachRetryContext = {
+        pending: pending,
+        recordUri: recordUri
+    };
+}
+
+function clearChunkedUploadAsyncAttachRetryContext() {
+    _chunkedUploadAsyncAttachRetryContext = null;
+    _chunkedUploadAsyncAttachRetryInProgress = false;
+}
+
+async function retryChunkedUploadAsyncAttachFromBadge() {
+    if (_chunkedUploadAsyncAttachRetryInProgress) {
+        return;
+    }
+
+    const context = _chunkedUploadAsyncAttachRetryContext;
+    if (!context || !context.pending || !context.recordUri) {
+        return;
+    }
+
+    _chunkedUploadAsyncAttachRetryInProgress = true;
+    updateAsyncAttachBadge(null, 'running');
+
+    try {
+        await runChunkedUploadAsyncAttach(context.pending, context.recordUri);
+    } catch (error) {
+        console.error('[ChunkedUpload] Async attach retry failed:', error);
+    } finally {
+        _chunkedUploadAsyncAttachRetryInProgress = false;
+    }
+}
+
+function tryParseChunkedUploadErrorBody(bodyText) {
+    if (!bodyText) return null;
+    try {
+        return JSON.parse(bodyText);
+    } catch (e) {
+        return null;
+    }
+}
+
+function createChunkedUploadHttpError(prefix, statusCode, bodyText) {
+    const parsed = tryParseChunkedUploadErrorBody(bodyText);
+    const responseStatus = parsed && parsed.ResponseStatus ? parsed.ResponseStatus : null;
+    const detail = responseStatus && responseStatus.Message
+        ? String(responseStatus.Message)
+        : (bodyText ? String(bodyText).slice(0, 240) : '');
+
+    const message = `${prefix} (HTTP ${statusCode})${detail ? `: ${detail}` : ''}`;
+    const error = new Error(message);
+    error.httpStatus = statusCode;
+    error.errorCode = responseStatus && responseStatus.ErrorCode ? String(responseStatus.ErrorCode) : '';
+    error.responseMessage = responseStatus && responseStatus.Message ? String(responseStatus.Message) : '';
+    return error;
+}
+
+function isChunkedUploadAsyncAttachRetryableError(error) {
+    if (!error) return true;
+
+    const status = Number(error.httpStatus || 0);
+    const errorCode = String(error.errorCode || '').toLowerCase();
+    const message = String(error.message || '').toLowerCase();
+    const responseMessage = String(error.responseMessage || '').toLowerCase();
+    const combined = `${message} ${responseMessage}`;
+
+    if (status === 404) return false;
+    if (errorCode === 'notfound') return false;
+    if (combined.indexOf('source file was not found') >= 0) return false;
+
+    return true;
+}
+
 function getOrCreateAsyncAttachBadge() {
     if (!document.body) return null;
 
@@ -332,6 +416,20 @@ function getOrCreateAsyncAttachBadge() {
     text.style.cssText = 'min-width:0;word-break:break-word;';
     badge.appendChild(text);
 
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;align-items:center;gap:8px;';
+
+    const retryButton = document.createElement('button');
+    retryButton.type = 'button';
+    retryButton.id = CHUNKED_UPLOAD_ASYNC_BADGE_RETRY_ID;
+    retryButton.className = 'btn btn-flat btn-secondary';
+    retryButton.textContent = 'Retry';
+    retryButton.style.cssText = 'display:none;white-space:nowrap;padding:4px 10px;';
+    retryButton.onclick = function () {
+        void retryChunkedUploadAsyncAttachFromBadge();
+    };
+    actions.appendChild(retryButton);
+
     const dismissButton = document.createElement('button');
     dismissButton.type = 'button';
     dismissButton.className = 'btn btn-flat btn-secondary';
@@ -344,7 +442,9 @@ function getOrCreateAsyncAttachBadge() {
         }
         updateAsyncAttachBadge(null, 'hidden');
     };
-    badge.appendChild(dismissButton);
+    actions.appendChild(dismissButton);
+
+    badge.appendChild(actions);
 
     document.body.appendChild(badge);
     syncAsyncAttachBadgeBottomOffset();
@@ -784,7 +884,7 @@ async function startChunkedUploadAsyncAttach(pending, recordUri) {
 
     if (!res.ok) {
         const body = await res.text();
-        throw new Error(`Failed to start async attach (HTTP ${res.status})${body ? `: ${body.slice(0, 240)}` : ''}`);
+        throw createChunkedUploadHttpError('Failed to start async attach', res.status, body);
     }
 
     return await res.json();
@@ -803,7 +903,7 @@ async function pollChunkedUploadAsyncAttach(jobId, timeoutMs, onStatus) {
 
         if (!res.ok) {
             const body = await res.text();
-            throw new Error(`Failed to query async attach status (HTTP ${res.status})${body ? `: ${body.slice(0, 240)}` : ''}`);
+            throw createChunkedUploadHttpError('Failed to query async attach status', res.status, body);
         }
 
         const status = await res.json();
@@ -823,37 +923,54 @@ async function pollChunkedUploadAsyncAttach(jobId, timeoutMs, onStatus) {
 async function runChunkedUploadAsyncAttach(pending, recordUri) {
     updateAsyncAttachBadgeForPending(pending, 'running');
 
-    const start = await startChunkedUploadAsyncAttach(pending, recordUri);
-    if (!start || !start.JobId) {
-        updateAsyncAttachBadgeForPending(pending, 'failed', 'Async attach failed to start');
-        throw new Error('Async attach start response did not include a JobId.');
-    }
-
-    logDebug(`[ChunkedUpload] Started async attach job ${start.JobId} for record ${recordUri}.`);
-    const status = await pollChunkedUploadAsyncAttach(start.JobId, 30 * 60 * 1000, function (nextStatus) {
-        if (!nextStatus) return;
-        const state = String(nextStatus.Status || '').toLowerCase();
-        if (state === 'queued') {
-            updateAsyncAttachBadgeForPending(pending, 'queued');
-        } else if (state === 'running') {
-            updateAsyncAttachBadgeForPending(pending, 'running');
-        }
-    });
-    if (status && status.Succeeded === true) {
-        updateAsyncAttachBadgeForPending(pending, 'succeeded');
-
-        if (pending.expectedHash) {
-            await verifyDocumentHash(recordUri, pending.expectedHash);
+    try {
+        const start = await startChunkedUploadAsyncAttach(pending, recordUri);
+        if (!start || !start.JobId) {
+            throw new Error('Async attach start response did not include a JobId.');
         }
 
-        await cleanupChunkedUpload(pending);
-        console.log(`[ChunkedUpload] Async attach completed for record ${recordUri}.`);
-        return;
-    }
+        logDebug(`[ChunkedUpload] Started async attach job ${start.JobId} for record ${recordUri}.`);
+        const status = await pollChunkedUploadAsyncAttach(start.JobId, 30 * 60 * 1000, function (nextStatus) {
+            if (!nextStatus) return;
+            const state = String(nextStatus.Status || '').toLowerCase();
+            if (state === 'queued') {
+                updateAsyncAttachBadgeForPending(pending, 'queued');
+            } else if (state === 'running') {
+                updateAsyncAttachBadgeForPending(pending, 'running');
+            }
+        });
 
-    const errorMessage = status && status.ErrorMessage ? status.ErrorMessage : 'Async attach did not complete successfully.';
-    updateAsyncAttachBadgeForPending(pending, 'failed', `Async attach failed: ${errorMessage}`);
-    throw new Error(errorMessage);
+        if (status && status.Succeeded === true) {
+            clearChunkedUploadAsyncAttachRetryContext();
+            updateAsyncAttachBadgeForPending(pending, 'succeeded');
+
+            if (pending.expectedHash) {
+                await verifyDocumentHash(recordUri, pending.expectedHash);
+            }
+
+            await cleanupChunkedUpload(pending);
+            console.log(`[ChunkedUpload] Async attach completed for record ${recordUri}.`);
+            return;
+        }
+
+        const errorMessage = status && status.ErrorMessage ? status.ErrorMessage : 'Async attach did not complete successfully.';
+        throw new Error(errorMessage);
+    } catch (error) {
+        const isRetryable = isChunkedUploadAsyncAttachRetryableError(error);
+        const rawMessage = error && error.message ? error.message : String(error || 'Async attach failed.');
+        const message = isRetryable
+            ? rawMessage
+            : 'Async attach source file was not found. Please upload the file again and save the record.';
+
+        if (isRetryable) {
+            setChunkedUploadAsyncAttachRetryContext(pending, recordUri);
+        } else {
+            clearChunkedUploadAsyncAttachRetryContext();
+        }
+
+        updateAsyncAttachBadgeForPending(pending, 'failed', `Async attach failed: ${message}`);
+        throw error;
+    }
 }
 
 async function abortChunkedUploadSessionById(sessionId) {
@@ -1741,6 +1858,7 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
     if (!badge) return;
 
     const messageElement = badge.querySelector(`#${CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID}`) || badge;
+    const retryButton = badge.querySelector(`#${CHUNKED_UPLOAD_ASYNC_BADGE_RETRY_ID}`);
 
     if (_chunkedUploadAsyncBadgeAutoDismissTimer) {
         clearTimeout(_chunkedUploadAsyncBadgeAutoDismissTimer);
@@ -1751,7 +1869,12 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
         badge.style.display = 'none';
         badge.dataset.state = '';
         messageElement.textContent = '';
+        if (retryButton) {
+            retryButton.style.display = 'none';
+            retryButton.disabled = false;
+        }
         clearPersistedAsyncAttachBadgeState();
+        clearChunkedUploadAsyncAttachRetryContext();
         return;
     }
 
@@ -1773,6 +1896,10 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
         _chunkedUploadAsyncBadgeRunningDots = 0;
     }
 
+    if (normalized === 'succeeded') {
+        clearChunkedUploadAsyncAttachRetryContext();
+    }
+
     if ((normalized === 'queued' || normalized === 'running') && _chunkedUploadAsyncBadgeTransientSuppressed) {
         return;
     }
@@ -1784,6 +1911,12 @@ function updateAsyncAttachBadge(koViewModelId, state, detailText) {
     badge.style.display = 'flex';
     badge.dataset.state = normalized;
     messageElement.textContent = text;
+
+    if (retryButton) {
+        const showRetry = normalized === 'failed' && !!_chunkedUploadAsyncAttachRetryContext;
+        retryButton.style.display = showRetry ? '' : 'none';
+        retryButton.disabled = _chunkedUploadAsyncAttachRetryInProgress;
+    }
 
     if (normalized === 'queued') {
         badge.style.background = '#e8f1ff';
@@ -2030,22 +2163,166 @@ function toChunkedUploadSuggestedTitle(fileName) {
     return raw;
 }
 
-function findChunkedUploadTitleElement(contextElement) {
-    const roots = [];
-    if (contextElement && contextElement.closest) {
-        const contextualRoot = contextElement.closest('form, [role="tabpanel"], .content-wrapper, body');
-        if (contextualRoot) roots.push(contextualRoot);
+function applyChunkedUploadTitleValue(titleElement, suggested) {
+    if (!titleElement || !suggested) return false;
+
+    titleElement.value = suggested;
+    titleElement.setAttribute('value', suggested);
+    titleElement.dispatchEvent(new Event('input', { bubbles: true }));
+    titleElement.dispatchEvent(new Event('change', { bubbles: true }));
+    titleElement.dispatchEvent(new Event('blur', { bubbles: true }));
+
+    return String(titleElement.value || '').trim() === suggested;
+}
+
+function resolveChunkedUploadRecordFormVm(contextElement) {
+    if (typeof ko === 'undefined') return null;
+
+    const looksLikeRecordFormVm = function (vm) {
+        if (!vm || typeof vm !== 'object') return false;
+        if (vm.myName === 'RecordDataEntryForm') return true;
+        if (vm.freeTextTitle && typeof vm.freeTextTitle.Value === 'function') return true;
+        if (vm.recordTitleDecorator && typeof vm.recordTitleDecorator.Value === 'function') return true;
+        return false;
+    };
+
+    let current = contextElement && contextElement.nodeType === 1 ? contextElement : document.activeElement;
+    let depth = 0;
+    while (current && depth < 20) {
+        try {
+            if (ko.dataFor) {
+                const vm = ko.dataFor(current);
+                if (looksLikeRecordFormVm(vm)) return vm;
+            }
+
+            if (ko.contextFor) {
+                let context = ko.contextFor(current);
+                let safety = 0;
+                while (context && safety < 20) {
+                    if (looksLikeRecordFormVm(context.$data)) {
+                        return context.$data;
+                    }
+                    context = context.$parentContext;
+                    safety++;
+                }
+            }
+        } catch (e) {
+            // Ignore KO context lookup failures and continue climbing DOM.
+        }
+
+        current = current.parentElement;
+        depth++;
     }
+
+    const rootRecordForm = window.root && window.root.recordMainCreationPanel;
+    if (looksLikeRecordFormVm(rootRecordForm)) {
+        return rootRecordForm;
+    }
+
+    return null;
+}
+
+function applyChunkedUploadTitleViaRecordFormVm(recordFormVm, suggested) {
+    if (!recordFormVm || !suggested) return false;
+
+    try {
+        if (recordFormVm.titleString && typeof recordFormVm.titleString === 'function') {
+            recordFormVm.titleString(suggested);
+        }
+
+        if (recordFormVm.freeTextTitle && typeof recordFormVm.freeTextTitle.Value === 'function') {
+            recordFormVm.freeTextTitle.Value(suggested);
+            if (typeof recordFormVm.freeTextTitle.error === 'function') {
+                recordFormVm.freeTextTitle.error('');
+            }
+            return true;
+        }
+
+        if (recordFormVm.recordTitleDecorator && typeof recordFormVm.recordTitleDecorator.Value === 'function') {
+            recordFormVm.recordTitleDecorator.Value(suggested);
+            if (typeof recordFormVm.recordTitleDecorator.error === 'function') {
+                recordFormVm.recordTitleDecorator.error('');
+            }
+            return true;
+        }
+    } catch (e) {
+        logDebug('[ChunkedUpload] Failed to apply title via RecordDataEntryForm VM:', e);
+    }
+
+    return false;
+}
+
+function rememberChunkedUploadSuggestedTitle(file, contextElement) {
+    const suggested = toChunkedUploadSuggestedTitle(file && file.name);
+    if (!suggested) return;
+
+    _chunkedUploadPendingSuggestedTitle = suggested;
+    _chunkedUploadPendingTitleContextElement = contextElement || null;
+    _chunkedUploadPendingTitleSetAtUtc = Date.now();
+}
+
+function clearChunkedUploadSuggestedTitle() {
+    _chunkedUploadPendingSuggestedTitle = '';
+    _chunkedUploadPendingTitleContextElement = null;
+    _chunkedUploadPendingTitleSetAtUtc = 0;
+}
+
+function findChunkedUploadTitleElement(contextElement, options) {
+    const config = options || {};
+    const preferEmpty = config.preferEmpty === true;
+    const excludeElement = config.excludeElement || null;
+    const roots = [];
+    
+    // First priority: search within contextual form (not body or document)
+    if (contextElement && contextElement.closest) {
+        const contextualForm = contextElement.closest('form, [role="tabpanel"], .content-wrapper');
+        if (contextualForm) {
+            roots.push(contextualForm);
+        }
+    }
+    
+    // Always include document as fallback to ensure we find the title element
     roots.push(document);
 
     for (let r = 0; r < roots.length; r++) {
         const root = roots[r];
         if (!root || typeof root.querySelectorAll !== 'function') continue;
 
+        // Prefer controls explicitly tied to the "Title (Free Text Part)" label.
+        const labels = root.querySelectorAll('label');
+        for (let i = 0; i < labels.length; i++) {
+            const label = labels[i];
+            const text = String(label.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            if (text.indexOf('title (free text part)') < 0) continue;
+
+            const forId = label.getAttribute('for');
+            if (forId) {
+                const byFor = root.querySelector(`#${forId}`);
+                if (byFor && (byFor.tagName === 'TEXTAREA' || byFor.tagName === 'INPUT')) {
+                    if (excludeElement && byFor === excludeElement) continue;
+                    if (preferEmpty && String(byFor.value || '').trim()) continue;
+                    return byFor;
+                }
+            }
+
+            const nearby = label.parentElement && label.parentElement.querySelector
+                ? label.parentElement.querySelector('textarea, input[type="text"]')
+                : null;
+            if (nearby) {
+                if (excludeElement && nearby === excludeElement) continue;
+                if (preferEmpty && String(nearby.value || '').trim()) continue;
+                return nearby;
+            }
+        }
+
+        let firstMatch = null;
+        let firstEmptyMatch = null;
+
         const controls = root.querySelectorAll('textarea, input[type="text"]');
         for (let i = 0; i < controls.length; i++) {
             const control = controls[i];
             if (!control || control.disabled || !isChunkedUploadElementVisible(control)) continue;
+            if (excludeElement && control === excludeElement) continue;
 
             const attrs = [
                 control.name,
@@ -2058,11 +2335,24 @@ function findChunkedUploadTitleElement(contextElement) {
             ].join(' ').toLowerCase();
 
             if (attrs.indexOf('title') >= 0 || attrs.indexOf('free text') >= 0 || attrs.indexOf('freetext') >= 0) {
-                return control;
+                if (!firstMatch) {
+                    firstMatch = control;
+                }
+
+                const value = String(control.value || '').trim();
+                if (!value && !firstEmptyMatch) {
+                    firstEmptyMatch = control;
+                }
             }
         }
 
-        const labels = root.querySelectorAll('label');
+        if (preferEmpty && firstEmptyMatch) {
+            return firstEmptyMatch;
+        }
+        if (firstMatch) {
+            return firstMatch;
+        }
+
         for (let i = 0; i < labels.length; i++) {
             const label = labels[i];
             const text = String(label.textContent || '').toLowerCase();
@@ -2072,6 +2362,8 @@ function findChunkedUploadTitleElement(contextElement) {
             if (forId) {
                 const byFor = root.querySelector(`#${forId}`);
                 if (byFor && (byFor.tagName === 'TEXTAREA' || byFor.tagName === 'INPUT')) {
+                    if (excludeElement && byFor === excludeElement) continue;
+                    if (preferEmpty && String(byFor.value || '').trim()) continue;
                     return byFor;
                 }
             }
@@ -2079,7 +2371,11 @@ function findChunkedUploadTitleElement(contextElement) {
             const nearby = label.parentElement && label.parentElement.querySelector
                 ? label.parentElement.querySelector('textarea, input[type="text"]')
                 : null;
-            if (nearby) return nearby;
+            if (nearby) {
+                if (excludeElement && nearby === excludeElement) continue;
+                if (preferEmpty && String(nearby.value || '').trim()) continue;
+                return nearby;
+            }
         }
     }
 
@@ -2087,19 +2383,97 @@ function findChunkedUploadTitleElement(contextElement) {
 }
 
 function tryAutofillChunkedUploadTitle(file, contextElement) {
-    const titleElement = findChunkedUploadTitleElement(contextElement);
-    if (!titleElement) return false;
+    const suggested = toChunkedUploadSuggestedTitle(file && file.name);
+    if (!suggested) {
+        logDebug('[ChunkedUpload] Could not derive suggested title from filename.');
+        return false;
+    }
+
+    const recordFormVm = resolveChunkedUploadRecordFormVm(contextElement);
+    if (recordFormVm) {
+        const existingVmTitle = String(
+            (recordFormVm.freeTextTitle && typeof recordFormVm.freeTextTitle.Value === 'function' && recordFormVm.freeTextTitle.Value()) ||
+            (recordFormVm.recordTitleDecorator && typeof recordFormVm.recordTitleDecorator.Value === 'function' && recordFormVm.recordTitleDecorator.Value()) ||
+            ''
+        ).trim();
+
+        if (!existingVmTitle && applyChunkedUploadTitleViaRecordFormVm(recordFormVm, suggested)) {
+            logDebug(`[ChunkedUpload] Autofilled title via RecordDataEntryForm VM: "${suggested}"`);
+            return true;
+        }
+    }
+
+    let titleElement = findChunkedUploadTitleElement(contextElement, { preferEmpty: true });
+    if (!titleElement) {
+        logDebug('[ChunkedUpload] Could not find title element for autofill.');
+        return false;
+    }
 
     const existing = String(titleElement.value || '').trim();
-    if (existing) return false;
+    if (existing) {
+        const alternateTitleElement = findChunkedUploadTitleElement(contextElement, {
+            preferEmpty: true,
+            excludeElement: titleElement
+        });
+        if (alternateTitleElement) {
+            titleElement = alternateTitleElement;
+        } else {
+            logDebug('[ChunkedUpload] Title element already has value, skipping autofill.');
+            return false;
+        }
+    }
 
-    const suggested = toChunkedUploadSuggestedTitle(file && file.name);
-    if (!suggested) return false;
+    if (applyChunkedUploadTitleValue(titleElement, suggested)) {
+        logDebug(`[ChunkedUpload] Autofilled title to: "${suggested}"`);
+        return true;
+    }
 
-    titleElement.value = suggested;
-    titleElement.dispatchEvent(new Event('input', { bubbles: true }));
-    titleElement.dispatchEvent(new Event('change', { bubbles: true }));
-    return true;
+    const verifyValue = String(titleElement.value || '').trim();
+    logDebug(`[ChunkedUpload] Title autofill failed - value was not persisted (found: "${verifyValue}")`);
+    return false;
+}
+
+function ensureChunkedUploadTitleBeforeSubmit(formElement) {
+    if (!_chunkedUploadPendingSuggestedTitle) {
+        return;
+    }
+
+    const ageMs = Date.now() - Number(_chunkedUploadPendingTitleSetAtUtc || 0);
+    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > (10 * 60 * 1000)) {
+        clearChunkedUploadSuggestedTitle();
+        return;
+    }
+
+    const searchRoot = formElement || _chunkedUploadPendingTitleContextElement || _chunkedUploadLastContextElement || document.body;
+
+    const recordFormVm = resolveChunkedUploadRecordFormVm(searchRoot);
+    if (recordFormVm) {
+        const currentVmTitle = String(
+            (recordFormVm.freeTextTitle && typeof recordFormVm.freeTextTitle.Value === 'function' && recordFormVm.freeTextTitle.Value()) ||
+            (recordFormVm.recordTitleDecorator && typeof recordFormVm.recordTitleDecorator.Value === 'function' && recordFormVm.recordTitleDecorator.Value()) ||
+            ''
+        ).trim();
+
+        if (!currentVmTitle && applyChunkedUploadTitleViaRecordFormVm(recordFormVm, _chunkedUploadPendingSuggestedTitle)) {
+            logDebug(`[ChunkedUpload] Restored pending title via RecordDataEntryForm VM before submit: "${_chunkedUploadPendingSuggestedTitle}"`);
+            return;
+        }
+    }
+
+    const titleElement = findChunkedUploadTitleElement(searchRoot, { preferEmpty: true });
+    if (!titleElement) {
+        return;
+    }
+
+    const existing = String(titleElement.value || '').trim();
+    if (existing) {
+        return;
+    }
+
+    const applied = applyChunkedUploadTitleValue(titleElement, _chunkedUploadPendingSuggestedTitle);
+    if (applied) {
+        logDebug(`[ChunkedUpload] Restored pending title before submit: "${_chunkedUploadPendingSuggestedTitle}"`);
+    }
 }
 
 function hideChunkedUploadProgressMessageDom() {
@@ -2172,6 +2546,7 @@ const handleChunkedUploadNativeFormSubmit = function (event) {
         : null;
 
     if (!formElement) return;
+    ensureChunkedUploadTitleBeforeSubmit(formElement);
     if (!tryInterceptChunkedUploadNativeFormSubmit(formElement)) return;
 
     // Stop legacy native file upload form submit; chunked upload has been started.
@@ -2293,6 +2668,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
         }
 
         hideChunkedUploadProgressMessageDom();
+        rememberChunkedUploadSuggestedTitle(file, effectiveContext);
         tryAutofillChunkedUploadTitle(file, effectiveContext);
         if (isLargeFilePilotCandidate) {
             updateAsyncAttachBadge(null, 'queued');
