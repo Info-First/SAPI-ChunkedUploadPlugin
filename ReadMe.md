@@ -34,6 +34,27 @@ window.setChunkedUploadLargeFilePilotThresholdMb(1024);
 window.getChunkedUploadLargeFilePilotThresholdMb();
 ```
 
+### Async attach operations notes
+
+The async attach flow is now validated for simultaneous jobs and includes operational UI behavior for better visibility.
+
+- Concurrent async attach jobs: validated successfully with multiple large-file saves in flight.
+- Server-side concurrency is controlled by `ChunkedUpload.AsyncAttachMaxConcurrency` (default `2`).
+- The status badge is shown as a bottom-left floating panel with states:
+  - `queued`
+  - `in progress`
+  - `completed`
+  - `failed`
+- `completed` auto-dismisses after 5 seconds.
+- Dismissing `queued`/`in progress` suppresses repeat transient updates for that upload lifecycle.
+- The debug banner is rendered as a bottom-left floating panel so it does not cover bottom-right action buttons.
+
+Recommended tuning guidance:
+
+- Start with `ChunkedUpload.AsyncAttachMaxConcurrency=2`.
+- Increase gradually only if CM host CPU/IO headroom and SDK stability are acceptable.
+- If failures rise under load, reduce concurrency and review server/plugin logs around `[AsyncAttach]` entries.
+
 ## Debug logging
 
 Browser-side debug logging can be enabled at runtime:

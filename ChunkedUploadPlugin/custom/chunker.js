@@ -23,6 +23,9 @@ let _chunkedUploadAsyncBadgeAutoDismissTimer = null;
 let _chunkedUploadAsyncBadgeTransientSuppressed = false;
 
 let _chunkedUploadResumeSweepPromise = null;
+const _chunkedUploadRecentNativeIntercepts = {};
+const _chunkedUploadActiveFileKeys = {};
+let _chunkedUploadLastContextElement = null;
 
 function clampChunkedUploadConcurrency(value) {
     const parsed = parseInt(value, 10);
@@ -893,6 +896,18 @@ async function abortChunkedUploadSessionById(sessionId) {
 
         const originalSend = xhr.send.bind(xhr);
         xhr.send = function (body) {
+            const isNativeFileUploadCall =
+                _method === 'POST' &&
+                isChunkedUploadNativePostFormDataUrl(_url);
+
+            if (isNativeFileUploadCall) {
+                const intercepted = tryInterceptChunkedUploadNativeFormDataBody(body);
+                if (intercepted) {
+                    logDebug('[ChunkedUpload] Intercepted native PostFormData upload and delegated to chunked flow.');
+                    return;
+                }
+            }
+
             const isRecordSaveCall =
                 _method === 'POST' &&
                 (/\/ServiceApi\/Record\b/i.test(_url) || /\/ServiceApi\/RecordCheckIn\b/i.test(_url) || /\/ServiceApi\/Record\/\d+\/CheckIn\b/i.test(_url));
@@ -1648,6 +1663,7 @@ const handleChunkedUploadFileChange = async function(event) {
     event.preventDefault();
     event.stopImmediatePropagation();
 
+    rememberChunkedUploadContext(fileInput);
     await processChunkedUploadFile(fileInput.files[0], fileInput, fileInput);
 };
 
@@ -1664,6 +1680,28 @@ function resolveUploadKoViewModel(sourceElement) {
         }
         current = current.parentElement;
         depth++;
+    }
+
+    return null;
+}
+
+function resolveAnyUploadKoViewModel() {
+    if (typeof ko === 'undefined' || !ko.dataFor) return null;
+
+    const candidates = document.querySelectorAll(
+        'input[type="file"][name="files[]"], input[type="file"][name="file"], input[type="file"], .upload-drop-zone, .dropzone, [data-dropzone]'
+    );
+
+    for (let i = 0; i < candidates.length; i++) {
+        const candidate = candidates[i];
+        if (!isChunkedUploadElementVisible(candidate)) continue;
+        const vm = resolveUploadKoViewModel(candidate);
+        if (vm) return vm;
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+        const vm = resolveUploadKoViewModel(candidates[i]);
+        if (vm) return vm;
     }
 
     return null;
@@ -1887,15 +1925,268 @@ const handleChunkedUploadDeleteConfirmCancelClick = function (event) {
     clearPendingChunkedUploadDeleteConfirmation();
 };
 
+function isChunkedUploadNativePostFormDataUrl(rawUrl) {
+    const normalized = String(rawUrl || '').toLowerCase();
+    return normalized.indexOf('/api/fileupload/postformdata') !== -1;
+}
+
+function buildChunkedUploadFileIdentityKey(file) {
+    if (!file) return '';
+    return [String(file.name || ''), String(file.size || 0), String(file.lastModified || 0)].join('|');
+}
+
+function shouldSkipChunkedUploadRecentNativeIntercept(file) {
+    const key = buildChunkedUploadFileIdentityKey(file);
+    if (!key) return false;
+
+    const now = Date.now();
+    const lastIntercept = Number(_chunkedUploadRecentNativeIntercepts[key] || 0);
+    if (Number.isFinite(lastIntercept) && (now - lastIntercept) < 1500) {
+        return true;
+    }
+
+    _chunkedUploadRecentNativeIntercepts[key] = now;
+    return false;
+}
+
+function rememberChunkedUploadContext(element) {
+    if (element && element.nodeType === 1) {
+        _chunkedUploadLastContextElement = element;
+    }
+}
+
+function isChunkedUploadFileActive(file) {
+    const key = buildChunkedUploadFileIdentityKey(file);
+    if (!key) return false;
+    return _chunkedUploadActiveFileKeys[key] === true;
+}
+
+function markChunkedUploadFileActive(file) {
+    const key = buildChunkedUploadFileIdentityKey(file);
+    if (!key) return '';
+    _chunkedUploadActiveFileKeys[key] = true;
+    return key;
+}
+
+function clearChunkedUploadFileActive(key) {
+    if (!key) return;
+    delete _chunkedUploadActiveFileKeys[key];
+}
+
+function isChunkedUploadElementVisible(element) {
+    return !!(element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length));
+}
+
+function toChunkedUploadSuggestedTitle(fileName) {
+    const raw = String(fileName || '').trim();
+    if (!raw) return '';
+
+    const dotIndex = raw.lastIndexOf('.');
+    if (dotIndex > 0) {
+        return raw.slice(0, dotIndex);
+    }
+
+    return raw;
+}
+
+function findChunkedUploadTitleElement(contextElement) {
+    const roots = [];
+    if (contextElement && contextElement.closest) {
+        const contextualRoot = contextElement.closest('form, [role="tabpanel"], .content-wrapper, body');
+        if (contextualRoot) roots.push(contextualRoot);
+    }
+    roots.push(document);
+
+    for (let r = 0; r < roots.length; r++) {
+        const root = roots[r];
+        if (!root || typeof root.querySelectorAll !== 'function') continue;
+
+        const controls = root.querySelectorAll('textarea, input[type="text"]');
+        for (let i = 0; i < controls.length; i++) {
+            const control = controls[i];
+            if (!control || control.disabled || !isChunkedUploadElementVisible(control)) continue;
+
+            const attrs = [
+                control.name,
+                control.id,
+                control.getAttribute('aria-label'),
+                control.getAttribute('placeholder'),
+                control.getAttribute('data-bind'),
+                control.getAttribute('data-field'),
+                control.className
+            ].join(' ').toLowerCase();
+
+            if (attrs.indexOf('title') >= 0 || attrs.indexOf('free text') >= 0 || attrs.indexOf('freetext') >= 0) {
+                return control;
+            }
+        }
+
+        const labels = root.querySelectorAll('label');
+        for (let i = 0; i < labels.length; i++) {
+            const label = labels[i];
+            const text = String(label.textContent || '').toLowerCase();
+            if (text.indexOf('title') < 0) continue;
+
+            const forId = label.getAttribute('for');
+            if (forId) {
+                const byFor = root.querySelector(`#${forId}`);
+                if (byFor && (byFor.tagName === 'TEXTAREA' || byFor.tagName === 'INPUT')) {
+                    return byFor;
+                }
+            }
+
+            const nearby = label.parentElement && label.parentElement.querySelector
+                ? label.parentElement.querySelector('textarea, input[type="text"]')
+                : null;
+            if (nearby) return nearby;
+        }
+    }
+
+    return null;
+}
+
+function tryAutofillChunkedUploadTitle(file, contextElement) {
+    const titleElement = findChunkedUploadTitleElement(contextElement);
+    if (!titleElement) return false;
+
+    const existing = String(titleElement.value || '').trim();
+    if (existing) return false;
+
+    const suggested = toChunkedUploadSuggestedTitle(file && file.name);
+    if (!suggested) return false;
+
+    titleElement.value = suggested;
+    titleElement.dispatchEvent(new Event('input', { bubbles: true }));
+    titleElement.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+}
+
+function hideChunkedUploadProgressMessageDom() {
+    const textNodes = document.querySelectorAll('div, span');
+    for (let i = 0; i < textNodes.length; i++) {
+        const node = textNodes[i];
+        const text = String(node.textContent || '').trim();
+
+        if (/^Upload Progress\s*:\s*\d+%$/i.test(text)) {
+            const container = node.closest('div, li, section') || node;
+            if (container && container.style) {
+                container.style.display = 'none';
+            } else if (node.style) {
+                node.style.display = 'none';
+            }
+        }
+    }
+}
+
+function extractChunkedUploadFileFromFormData(formData) {
+    if (!formData || typeof formData.entries !== 'function') return null;
+
+    const iterator = formData.entries();
+    if (!iterator || typeof iterator.next !== 'function') return null;
+
+    let step = iterator.next();
+    while (step && step.done !== true) {
+        const pair = step.value || [];
+        const value = pair[1];
+        if (value && typeof value === 'object' && typeof value.name === 'string' && typeof value.size === 'number') {
+            return value;
+        }
+        step = iterator.next();
+    }
+
+    return null;
+}
+
+function tryInterceptChunkedUploadNativeFormDataBody(body) {
+    if (!body || typeof FormData === 'undefined' || !(body instanceof FormData)) {
+        return false;
+    }
+
+    const file = extractChunkedUploadFileFromFormData(body);
+    if (!file) return false;
+    if (isChunkedUploadFileActive(file)) return true;
+    if (shouldSkipChunkedUploadRecentNativeIntercept(file)) return true;
+
+    const fallbackInput = _chunkedUploadLastContextElement || document.querySelector('input[type="file"][name="files[]"], input[type="file"][name="file"], input[type="file"]');
+    rememberChunkedUploadContext(fallbackInput || document.body);
+    void processChunkedUploadFile(file, fallbackInput || document.body, fallbackInput || null);
+    return true;
+}
+
+function tryInterceptChunkedUploadNativeFormSubmit(formElement) {
+    if (!formElement || !formElement.action) return false;
+    if (!isChunkedUploadNativePostFormDataUrl(formElement.action)) return false;
+
+    const fileInput = formElement.querySelector('input[type="file"]');
+    if (!fileInput || !fileInput.files || fileInput.files.length === 0) return false;
+
+    rememberChunkedUploadContext(fileInput);
+    void processChunkedUploadFile(fileInput.files[0], fileInput, fileInput);
+    return true;
+}
+
+const handleChunkedUploadNativeFormSubmit = function (event) {
+    const formElement = event && event.target && event.target.closest
+        ? event.target.closest('form')
+        : null;
+
+    if (!formElement) return;
+    if (!tryInterceptChunkedUploadNativeFormSubmit(formElement)) return;
+
+    // Stop legacy native file upload form submit; chunked upload has been started.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+};
+
+(function installChunkedUploadNativeFormSubmitInterceptor() {
+    if (window.__chunkedUploadNativeFormSubmitInterceptorInstalled === true) {
+        return;
+    }
+    window.__chunkedUploadNativeFormSubmitInterceptorInstalled = true;
+
+    document.addEventListener('submit', handleChunkedUploadNativeFormSubmit, true);
+
+    const FormProto = (window.HTMLFormElement && window.HTMLFormElement.prototype)
+        ? window.HTMLFormElement.prototype
+        : null;
+    if (!FormProto || FormProto.__chunkedUploadSubmitPatched === true) {
+        return;
+    }
+
+    const originalSubmit = FormProto.submit;
+    if (typeof originalSubmit !== 'function') {
+        return;
+    }
+
+    FormProto.submit = function () {
+        if (tryInterceptChunkedUploadNativeFormSubmit(this)) {
+            return;
+        }
+        return originalSubmit.apply(this, arguments);
+    };
+    FormProto.__chunkedUploadSubmitPatched = true;
+})();
+
 async function processChunkedUploadFile(file, contextElement, clearInputElement) {
     if (!file) return;
+
+    const effectiveContext = contextElement || _chunkedUploadLastContextElement || document.activeElement || document.body;
+    rememberChunkedUploadContext(effectiveContext);
+
+    if (isChunkedUploadFileActive(file)) {
+        logDebug('[ChunkedUpload] Skipping duplicate process invocation for active file:', file.name);
+        return;
+    }
+
+    const activeFileKey = markChunkedUploadFileActive(file);
 
     // Starting a new upload should clear stale async attach status from prior flows.
     _chunkedUploadAsyncBadgeTransientSuppressed = false;
     updateAsyncAttachBadge(null, 'hidden');
+    hideChunkedUploadProgressMessageDom();
 
-    const koViewModel = resolveUploadKoViewModel(contextElement);
-    const checkInOptions = resolveCheckInOptionsFromContext(contextElement);
+    const koViewModel = resolveUploadKoViewModel(effectiveContext) || resolveAnyUploadKoViewModel();
+    const checkInOptions = resolveCheckInOptionsFromContext(effectiveContext);
     const isLargeFilePilotCandidate = isChunkedUploadLargeFilePilotCandidate(file.size);
     const cancellationState = {
         cancelled: false,
@@ -1914,6 +2205,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
 
     try {
         const result = await uploadFileInChunks(file, function (percent) {
+            hideChunkedUploadProgressMessageDom();
             window._chunkedUploadOverlay.update(percent, getChunkedUploadProgressMessage(percent, cancellationState.isResumingUpload === true));
         }, cancellationState, checkInOptions);
 
@@ -1955,11 +2247,14 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
             deferNativeAttach: isLargeFilePilotCandidate
         })) {
             logDebug('Injected staged path and visible success state into KO uploader. UploadedFileName:', uiUploadedFileName || '(deferred async attach)');
-            if (isLargeFilePilotCandidate) {
-                updateAsyncAttachBadge(null, 'queued');
-            }
         } else {
             console.warn('Could not find KO ViewModel for uploader context; upload may not save correctly.');
+        }
+
+        hideChunkedUploadProgressMessageDom();
+        tryAutofillChunkedUploadTitle(file, effectiveContext);
+        if (isLargeFilePilotCandidate) {
+            updateAsyncAttachBadge(null, 'queued');
         }
 
         // Brief pause so the user sees 100% before the overlay disappears.
@@ -1981,6 +2276,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
         // then auto-dismiss after 4 seconds.
         setTimeout(function () { window._chunkedUploadOverlay.hide(); }, 4000);
     } finally {
+        clearChunkedUploadFileActive(activeFileKey);
         // Always reset chooser value so selecting the same file again re-triggers change.
         if (clearInputElement && typeof clearInputElement.value !== 'undefined') {
             clearInputElement.value = '';
@@ -1988,12 +2284,90 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
     }
 }
 
-const handleChunkedUploadDrop = async function (event) {
-    const dropZone = event && event.target && event.target.closest
-        ? event.target.closest('.upload-drop-zone.dropzone')
-        : null;
+function resolveChunkedUploadDropContext(event) {
+    if (!event) return null;
 
-    if (!dropZone) return;
+    const resolveInput = function (root) {
+        if (!root || typeof root.querySelector !== 'function') return null;
+        return root.querySelector('input[type="file"][name="files[]"], input[type="file"][name="file"], input[type="file"]');
+    };
+
+    const path = (typeof event.composedPath === 'function') ? event.composedPath() : [];
+    for (let i = 0; i < path.length; i++) {
+        const node = path[i];
+        if (!node || node === window || node === document) continue;
+
+        if (node.matches && node.matches('.upload-drop-zone.dropzone, .upload-drop-zone, .dropzone, [data-dropzone]')) {
+            return {
+                container: node,
+                input: resolveInput(node)
+            };
+        }
+
+        const candidateInput = resolveInput(node);
+        if (candidateInput) {
+            return {
+                container: node,
+                input: candidateInput
+            };
+        }
+    }
+
+    const target = event.target;
+    let current = target && target.nodeType === 1 ? target : (target && target.parentElement ? target.parentElement : null);
+    let depth = 0;
+    while (current && depth < 16) {
+        if (current.matches && current.matches('.upload-drop-zone.dropzone, .upload-drop-zone, .dropzone, [data-dropzone]')) {
+            return {
+                container: current,
+                input: resolveInput(current)
+            };
+        }
+
+        const candidateInput = resolveInput(current);
+        if (candidateInput) {
+            return {
+                container: current,
+                input: candidateInput
+            };
+        }
+
+        current = current.parentElement;
+        depth++;
+    }
+
+    const globalInput = document.querySelector('input[type="file"][name="files[]"], input[type="file"][name="file"], input[type="file"]');
+    if (!globalInput) return null;
+    return { container: globalInput, input: globalInput };
+}
+
+function isChunkedUploadFileDrop(event) {
+    if (!event || !event.dataTransfer) return false;
+
+    const files = event.dataTransfer.files;
+    if (files && files.length > 0) {
+        return true;
+    }
+
+    const items = event.dataTransfer.items;
+    if (!items || items.length === 0) {
+        return false;
+    }
+
+    for (let i = 0; i < items.length; i++) {
+        if (items[i] && items[i].kind === 'file') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+const handleChunkedUploadDrop = async function (event) {
+    if (!isChunkedUploadFileDrop(event)) return;
+
+    const dropContext = resolveChunkedUploadDropContext(event);
+    if (!dropContext) return;
 
     const dt = event.dataTransfer;
     if (!dt || !dt.files || dt.files.length === 0) return;
@@ -2002,15 +2376,15 @@ const handleChunkedUploadDrop = async function (event) {
     event.preventDefault();
     event.stopImmediatePropagation();
 
-    const hiddenInput = dropZone.querySelector('input[type="file"][name="files[]"]');
-    await processChunkedUploadFile(dt.files[0], hiddenInput || dropZone, hiddenInput || null);
+    rememberChunkedUploadContext(dropContext.input || dropContext.container);
+    await processChunkedUploadFile(dt.files[0], dropContext.input || dropContext.container, dropContext.input || null);
 };
 
 const handleChunkedUploadDragOver = function (event) {
-    const dropZone = event && event.target && event.target.closest
-        ? event.target.closest('.upload-drop-zone.dropzone')
-        : null;
-    if (!dropZone) return;
+    if (!isChunkedUploadFileDrop(event)) return;
+
+    const dropContext = resolveChunkedUploadDropContext(event);
+    if (!dropContext) return;
 
     // Required for browsers to allow drop.
     event.preventDefault();
@@ -2025,6 +2399,8 @@ if (window.__chunkedUploadChangeHandlerInstalled !== true) {
 }
 
 if (window.__chunkedUploadDropHandlerInstalled !== true) {
+    window.addEventListener('dragover', handleChunkedUploadDragOver, true);
+    window.addEventListener('drop', handleChunkedUploadDrop, true);
     document.addEventListener('dragover', handleChunkedUploadDragOver, true);
     document.addEventListener('drop', handleChunkedUploadDrop, true);
     window.__chunkedUploadDropHandlerInstalled = true;

@@ -241,6 +241,8 @@ namespace HP.HPTRIM.ServiceAPI
         private static readonly TimeSpan AsyncAttachJobRetention = TimeSpan.FromHours(6);
         private static readonly int AsyncAttachMaxConcurrency = GetAsyncAttachMaxConcurrency();
         private static readonly SemaphoreSlim AsyncAttachExecutionGate = new SemaphoreSlim(AsyncAttachMaxConcurrency, AsyncAttachMaxConcurrency);
+        private static readonly TimeSpan AsyncAttachJobTimeout = GetAsyncAttachJobTimeout();
+        private static readonly Timer OrphanedSessionCleanupTimer = new Timer(_ => CleanupOrphanedSessions(), null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(30));
         private readonly UploadSessionStore sessionStore = new UploadSessionStore();
 
         public object Post(StartChunkedUpload request)
@@ -823,12 +825,24 @@ namespace HP.HPTRIM.ServiceAPI
                 return;
             }
 
-            job.Status = "Running";
-            job.UpdatedUtc = DateTime.UtcNow;
-
+            // Status remains "Queued" until the gate slot is actually acquired.
             try
             {
-                AsyncAttachExecutionGate.Wait();
+                bool acquired = AsyncAttachExecutionGate.Wait(AsyncAttachJobTimeout);
+                if (!acquired)
+                {
+                    job.Status = "Failed";
+                    job.Succeeded = false;
+                    job.Completed = true;
+                    job.CompletedUtc = DateTime.UtcNow;
+                    job.UpdatedUtc = DateTime.UtcNow;
+                    job.ErrorMessage = $"Job timed out after {AsyncAttachJobTimeout.TotalMinutes:0} minutes waiting for an available concurrency slot.";
+                    Logger.Warn($"[AsyncAttach] Job {job.JobId} timed out waiting for gate.");
+                    return;
+                }
+
+                job.Status = "Running";
+                job.UpdatedUtc = DateTime.UtcNow;
                 try
                 {
                     // Run the long-running attach in a background worker so the client does not
@@ -858,18 +872,22 @@ namespace HP.HPTRIM.ServiceAPI
 
                         record.SetDocument(inputDocument, job.NewRevision, job.KeepCheckedOut, comments);
                         record.Save();
+
+                        job.Status = "Succeeded";
+                        job.Succeeded = true;
+                        job.Completed = true;
+                        job.CompletedUtc = DateTime.UtcNow;
+                        job.UpdatedUtc = DateTime.UtcNow;
+
+                        // Delete the staged file now that CM has a copy; errors are suppressed
+                        // so the job remains marked Succeeded even if cleanup fails.
+                        TryDeleteAsyncAttachStagedFile(job);
                     }
                 }
                 finally
                 {
                     AsyncAttachExecutionGate.Release();
                 }
-
-                job.Status = "Succeeded";
-                job.Succeeded = true;
-                job.Completed = true;
-                job.CompletedUtc = DateTime.UtcNow;
-                job.UpdatedUtc = DateTime.UtcNow;
             }
             catch (Exception ex)
             {
@@ -898,6 +916,62 @@ namespace HP.HPTRIM.ServiceAPI
             }
         }
 
+        private static void CleanupOrphanedSessions()
+        {
+            try
+            {
+                var root = ResolveChunkRootPathForCleanup();
+                if (!Directory.Exists(root))
+                {
+                    return;
+                }
+
+                var store = new UploadSessionStore();
+                var now = DateTime.UtcNow;
+                foreach (var sessionDirectory in Directory.GetDirectories(root))
+                {
+                    var sessionId = Path.GetFileName(sessionDirectory);
+                    if (string.IsNullOrWhiteSpace(sessionId) || sessionId.Any(ch => !char.IsLetterOrDigit(ch)))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var session = store.GetSession(sessionId);
+                        if (session == null)
+                        {
+                            continue;
+                        }
+
+                        if (session.ExpiresUtc < now && store.CancelSession(sessionId))
+                        {
+                            Logger.Info($"[CleanupChunkedUpload] Deleted expired session directory: {sessionId}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"[CleanupChunkedUpload] Failed sweeping session {sessionId}: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[CleanupChunkedUpload] Orphaned session sweep failed: {ex.Message}");
+            }
+        }
+
+        private static string ResolveChunkRootPathForCleanup()
+        {
+            var configured = ConfigurationManager.AppSettings["ChunkedUpload.TempPath"];
+            if (!string.IsNullOrWhiteSpace(configured))
+            {
+                return configured;
+            }
+
+            return @"D:\Micro Focus Content Manager\ServiceAPIWorkpath\ChunkedUploads";
+        }
+
         private static int GetAsyncAttachMaxConcurrency()
         {
             int configured;
@@ -909,6 +983,44 @@ namespace HP.HPTRIM.ServiceAPI
             // Allow parallel async attach jobs by default while avoiding unbounded
             // resource pressure on the CM SDK host process.
             return 2;
+        }
+
+        private static TimeSpan GetAsyncAttachJobTimeout()
+        {
+            int configuredMinutes;
+            if (int.TryParse(ConfigurationManager.AppSettings["ChunkedUpload.AsyncAttachJobTimeoutMinutes"], out configuredMinutes) && configuredMinutes > 0)
+            {
+                return TimeSpan.FromMinutes(configuredMinutes);
+            }
+
+            return TimeSpan.FromMinutes(30);
+        }
+
+        private static void TryDeleteAsyncAttachStagedFile(AsyncAttachJobState job)
+        {
+            if (job == null || string.IsNullOrWhiteSpace(job.FilePath))
+            {
+                return;
+            }
+
+            try
+            {
+                if (!IsPathUnderAllowedRoot(job.FilePath, ResolveChunkRootPathForCleanup()))
+                {
+                    Logger.Warn($"[AsyncAttach] Skip staged file cleanup outside allowed root for job {job.JobId}: {job.FilePath}");
+                    return;
+                }
+
+                if (File.Exists(job.FilePath))
+                {
+                    File.Delete(job.FilePath);
+                    Logger.Info($"[AsyncAttach] Deleted staged file for job {job.JobId}: {job.FilePath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[AsyncAttach] Could not delete staged file for job {job.JobId}: {ex.Message}");
+            }
         }
 
         private static TRIM.SDK.Database CreateAsyncAttachDatabase(AsyncAttachJobState job)

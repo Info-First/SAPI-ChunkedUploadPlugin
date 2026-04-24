@@ -1,5 +1,6 @@
 using ServiceStack;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Configuration;
 using System.IO;
@@ -16,6 +17,7 @@ namespace HP.HPTRIM.ServiceAPI
     {
         private const string ManifestFileName = "session.json";
         private static readonly object SyncRoot = new object();
+        private static readonly ConcurrentDictionary<string, object> SessionLocks = new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
         public int[] GetMissingChunks(UploadSessionState session)
         {
             if (session == null) throw new ArgumentNullException(nameof(session));
@@ -27,7 +29,14 @@ namespace HP.HPTRIM.ServiceAPI
         {
             ValidateSessionId(sessionId);
             string dir = GetSessionDirectory(sessionId);
-            return TryDeleteDirectory(dir, 5, 75);
+            var cancelled = TryDeleteDirectory(dir, 5, 75);
+            if (cancelled)
+            {
+                object removed;
+                SessionLocks.TryRemove(sessionId, out removed);
+            }
+
+            return cancelled;
         }
         private readonly string rootPath;
 
@@ -103,7 +112,7 @@ namespace HP.HPTRIM.ServiceAPI
                 return null;
             }
 
-            lock (SyncRoot)
+            lock (GetSessionLock(sessionId))
             {
                 using (var stream = File.OpenRead(manifestPath))
                 {
@@ -167,7 +176,7 @@ namespace HP.HPTRIM.ServiceAPI
             }
 
             UploadSessionState sessionToSave = session;
-            lock (SyncRoot)
+            lock (GetSessionLock(session.SessionId))
             {
                 string manifestPath = GetManifestPath(session.SessionId);
                 if (File.Exists(manifestPath))
@@ -280,6 +289,9 @@ namespace HP.HPTRIM.ServiceAPI
             {
                 throw new IOException(string.Format("Failed to delete upload session directory '{0}'.", sessionDirectory));
             }
+
+            object removed;
+            SessionLocks.TryRemove(sessionId, out removed);
         }
 
         private static bool TryDeleteDirectory(string directoryPath, int attempts, int delayMs)
@@ -333,7 +345,7 @@ namespace HP.HPTRIM.ServiceAPI
             Directory.CreateDirectory(sessionDirectory);
 
             string manifestPath = GetManifestPath(session.SessionId);
-            lock (SyncRoot)
+            lock (GetSessionLock(session.SessionId))
             {
                 using (var stream = File.Create(manifestPath))
                 {
@@ -341,6 +353,11 @@ namespace HP.HPTRIM.ServiceAPI
                     serializer.WriteObject(stream, session);
                 }
             }
+        }
+
+        private static object GetSessionLock(string sessionId)
+        {
+            return SessionLocks.GetOrAdd(sessionId ?? string.Empty, _ => new object());
         }
 
         private string GetManifestPath(string sessionId)
