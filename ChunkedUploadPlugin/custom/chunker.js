@@ -12,6 +12,11 @@ const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload')
 const CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT = 4;
 const CHUNKED_UPLOAD_MAX_CONCURRENT_STORAGE_KEY = 'cm_chunked_upload_max_concurrent';
 const CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT = 1024;
+const CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_SESSION_KEY = 'cm_chunked_upload_dynamic_threshold_mb';
+const CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_UPDATED_AT_SESSION_KEY = 'cm_chunked_upload_dynamic_threshold_updated_utc';
+const CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_TTL_MS = 30 * 60 * 1000;
+const CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_MIN = 128;
+const CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_MAX = 2048;
 const CHUNKED_UPLOAD_RESUME_KEY_PREFIX = 'cm_upload_staged_';
 const CHUNKED_UPLOAD_RESUME_SWEEP_MARKER_KEY = 'cm_upload_staged_last_sweep_utc';
 const CHUNKED_UPLOAD_RESUME_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -96,12 +101,30 @@ function resolveChunkedUploadConcurrency() {
 }
 
 function resolveChunkedUploadLargeFilePilotThresholdMb() {
+    // Explicit override always wins.
     const configured = window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB;
     const parsed = parseInt(configured, 10);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+    if (Number.isFinite(parsed) && parsed > 0) {
+        return clampChunkedUploadLargeFilePilotThresholdMb(parsed);
+    }
+
+    // Dynamic threshold can be disabled from host page.
+    if (window.CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_ENABLED === false) {
         return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
     }
-    return parsed;
+
+    const cached = getCachedChunkedUploadDynamicThresholdMb();
+    if (cached !== null) {
+        return cached;
+    }
+
+    const resolvedDynamic = calculateChunkedUploadDynamicThresholdMb();
+    if (resolvedDynamic !== null) {
+        cacheChunkedUploadDynamicThresholdMb(resolvedDynamic);
+        return resolvedDynamic;
+    }
+
+    return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
 }
 
 function resolveChunkedUploadLargeFilePilotThresholdBytes() {
@@ -121,9 +144,20 @@ window.setChunkedUploadLargeFilePilotThresholdMb = function (value) {
     const parsed = parseInt(value, 10);
     const normalized = (!Number.isFinite(parsed) || parsed <= 0)
         ? CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT
-        : parsed;
+        : clampChunkedUploadLargeFilePilotThresholdMb(parsed);
     window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB = normalized;
     return normalized;
+};
+
+window.resetChunkedUploadLargeFilePilotThresholdMb = function () {
+    window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB = null;
+    clearCachedChunkedUploadDynamicThresholdMb();
+    return resolveChunkedUploadLargeFilePilotThresholdMb();
+};
+
+window.refreshChunkedUploadDynamicThresholdMb = function () {
+    clearCachedChunkedUploadDynamicThresholdMb();
+    return resolveChunkedUploadLargeFilePilotThresholdMb();
 };
 
 window.setChunkedUploadConcurrency = function (value) {
@@ -139,6 +173,154 @@ window.setChunkedUploadConcurrency = function (value) {
 window.getChunkedUploadConcurrency = function () {
     return resolveChunkedUploadConcurrency();
 };
+
+function clampChunkedUploadLargeFilePilotThresholdMb(value) {
+    const parsed = parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
+    }
+    return Math.max(CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_MIN, Math.min(CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_MAX, parsed));
+}
+
+function readChunkedUploadNetworkDownlinkMbps() {
+    const connection = navigator && (navigator.connection || navigator.mozConnection || navigator.webkitConnection);
+    if (!connection) return null;
+
+    const downlink = Number(connection.downlink || 0);
+    if (Number.isFinite(downlink) && downlink > 0) {
+        return downlink;
+    }
+
+    const effectiveType = String(connection.effectiveType || '').toLowerCase();
+    if (effectiveType === 'slow-2g') return 0.05;
+    if (effectiveType === '2g') return 0.2;
+    if (effectiveType === '3g') return 1.5;
+    if (effectiveType === '4g') return 10;
+    if (effectiveType === '5g') return 35;
+    return null;
+}
+
+function readChunkedUploadPerformanceHintMbps() {
+    try {
+        if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
+            return null;
+        }
+
+        const entries = window.performance.getEntriesByType('resource') || [];
+        let bestMbps = null;
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i];
+            if (!entry || !entry.transferSize || !entry.duration) continue;
+            if (entry.transferSize < 80 * 1024) continue; // Ignore tiny assets.
+
+            const bits = Number(entry.transferSize) * 8;
+            const seconds = Number(entry.duration) / 1000;
+            if (!Number.isFinite(bits) || !Number.isFinite(seconds) || seconds <= 0) continue;
+
+            const mbps = bits / seconds / 1000 / 1000;
+            if (!Number.isFinite(mbps) || mbps <= 0) continue;
+
+            if (bestMbps === null || mbps > bestMbps) {
+                bestMbps = mbps;
+            }
+        }
+
+        return bestMbps;
+    } catch (e) {
+        return null;
+    }
+}
+
+function mapChunkedUploadMbpsToThresholdMb(mbps) {
+    if (!Number.isFinite(mbps) || mbps <= 0) {
+        return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
+    }
+
+    if (mbps < 2) return 256;
+    if (mbps < 5) return 512;
+    if (mbps < 20) return 1024;
+    if (mbps < 60) return 1536;
+    return 2048;
+}
+
+function calculateChunkedUploadDynamicThresholdMb() {
+    const networkHint = readChunkedUploadNetworkDownlinkMbps();
+    const perfHint = readChunkedUploadPerformanceHintMbps();
+
+    let chosenMbps = null;
+    if (Number.isFinite(networkHint) && Number.isFinite(perfHint)) {
+        // Use conservative estimate to avoid over-thresholding on unstable links.
+        chosenMbps = Math.min(networkHint, perfHint);
+    } else if (Number.isFinite(networkHint)) {
+        chosenMbps = networkHint;
+    } else if (Number.isFinite(perfHint)) {
+        chosenMbps = perfHint;
+    }
+
+    if (!Number.isFinite(chosenMbps) || chosenMbps <= 0) {
+        return null;
+    }
+
+    return clampChunkedUploadLargeFilePilotThresholdMb(mapChunkedUploadMbpsToThresholdMb(chosenMbps));
+}
+
+function getCachedChunkedUploadDynamicThresholdMb() {
+    try {
+        const raw = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_SESSION_KEY);
+        const updatedRaw = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_UPDATED_AT_SESSION_KEY);
+        if (!raw || !updatedRaw) return null;
+
+        const updated = Number(updatedRaw);
+        const ageMs = Date.now() - updated;
+        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_TTL_MS) {
+            clearCachedChunkedUploadDynamicThresholdMb();
+            return null;
+        }
+
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            clearCachedChunkedUploadDynamicThresholdMb();
+            return null;
+        }
+
+        return clampChunkedUploadLargeFilePilotThresholdMb(parsed);
+    } catch (e) {
+        return null;
+    }
+}
+
+function cacheChunkedUploadDynamicThresholdMb(value) {
+    try {
+        const normalized = clampChunkedUploadLargeFilePilotThresholdMb(value);
+        sessionStorage.setItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_SESSION_KEY, String(normalized));
+        sessionStorage.setItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_UPDATED_AT_SESSION_KEY, String(Date.now()));
+    } catch (e) {
+        // Ignore sessionStorage write issues.
+    }
+}
+
+function clearCachedChunkedUploadDynamicThresholdMb() {
+    try {
+        sessionStorage.removeItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_SESSION_KEY);
+        sessionStorage.removeItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_UPDATED_AT_SESSION_KEY);
+    } catch (e) {
+        // Ignore sessionStorage delete issues.
+    }
+}
+
+function installChunkedUploadDynamicThresholdRefresh() {
+    const connection = navigator && (navigator.connection || navigator.mozConnection || navigator.webkitConnection);
+    if (!connection || typeof connection.addEventListener !== 'function') {
+        return;
+    }
+
+    connection.addEventListener('change', function () {
+        if (window.CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_ENABLED === false) {
+            return;
+        }
+        clearCachedChunkedUploadDynamicThresholdMb();
+    });
+}
 
 function getChunkedUploadDebugBanner() {
     let banner = document.getElementById(CHUNKED_UPLOAD_DEBUG_BANNER_ID);
@@ -638,6 +820,7 @@ function getChunkedUploadProgressMessage(percent, isResuming) {
 logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
 installChunkedUploadDebugBanner();
 restoreAsyncAttachBadgeFromSession();
+installChunkedUploadDynamicThresholdRefresh();
 window.addEventListener('resize', syncAsyncAttachBadgeBottomOffset);
 window.addEventListener('resize', updateChunkedUploadDebugBanner);
 void ensureChunkedUploadResumeSweep();
