@@ -17,7 +17,7 @@ This project adds a custom Content Manager ServiceAPI plugin that supports resum
 
 The Web Client integration script now includes a pilot behavior for very large files.
 
-- Pilot threshold default: 1024 MB.
+- Pilot threshold default: 256 MB.
 - Files smaller than the threshold continue to use the normal flow.
 - Files at or above the threshold are flagged as pilot candidates.
 - If CM native save returns HTTP 504 or 524 after chunk upload has completed, the script:
@@ -33,6 +33,34 @@ Runtime threshold controls in browser console:
 window.setChunkedUploadLargeFilePilotThresholdMb(1024);
 window.getChunkedUploadLargeFilePilotThresholdMb();
 ```
+
+### Dynamic threshold and concurrency tuning
+
+The Web Client script can derive runtime values from browser network/performance hints when explicit overrides are not set.
+
+- Threshold resolution order: explicit override -> dynamic cached value -> computed dynamic value -> default (256 MB).
+- Concurrency resolution order: explicit override -> persisted user setting -> dynamic cached value -> computed dynamic value -> default (4).
+- Dynamic values are cached in session storage for 30 minutes.
+- Threshold guardrails: min 128 MB, max 2048 MB.
+- Performance-only threshold path is capped at 1024 MB when Network Information API hints are unavailable.
+- Dynamic concurrency guardrails: min 1, max 8.
+- Performance-only concurrency path is capped at 4 when Network Information API hints are unavailable.
+
+Runtime diagnostics and refresh helpers:
+
+```javascript
+window.getChunkedUploadDynamicThresholdDiagnostics();
+window.refreshChunkedUploadDynamicThresholdMb();
+window.getChunkedUploadDynamicConcurrencyDiagnostics();
+window.refreshChunkedUploadDynamicConcurrency();
+window.getChunkedUploadConcurrency();
+```
+
+Probe status:
+
+- Tiny upload probe is intentionally deferred.
+- Current dynamic logic uses Network Information API and performance timing hints with conservative perf-only caps.
+- Revisit probe implementation only if Azure validation shows unstable hint quality or repeated misclassification.
 
 ### Async attach operations notes
 

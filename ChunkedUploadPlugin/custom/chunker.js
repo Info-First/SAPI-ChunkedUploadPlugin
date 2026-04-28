@@ -11,6 +11,10 @@ const JSON_ACCEPT_HEADERS = { 'Accept': 'application/json' };
 const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload').replace(/^\/+|\/+$/g, '');
 const CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT = 4;
 const CHUNKED_UPLOAD_MAX_CONCURRENT_STORAGE_KEY = 'cm_chunked_upload_max_concurrent';
+const CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_SESSION_KEY = 'cm_chunked_upload_dynamic_concurrency';
+const CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_UPDATED_AT_SESSION_KEY = 'cm_chunked_upload_dynamic_concurrency_updated_utc';
+const CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_TTL_MS = 30 * 60 * 1000;
+const CHUNKED_UPLOAD_PERF_ONLY_MAX_CONCURRENT_CAP = 4;
 const CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT = 256;
 const CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_SESSION_KEY = 'cm_chunked_upload_dynamic_threshold_mb';
 const CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_UPDATED_AT_SESSION_KEY = 'cm_chunked_upload_dynamic_threshold_updated_utc';
@@ -88,7 +92,7 @@ function getPersistedChunkedUploadConcurrency() {
 }
 
 function resolveChunkedUploadConcurrency() {
-    // Priority: explicit page/global override, then persisted user setting, then default.
+    // Priority: explicit page/global override, then persisted user setting, then dynamic hint, then default.
     if (window.CHUNKED_UPLOAD_MAX_CONCURRENT !== undefined && window.CHUNKED_UPLOAD_MAX_CONCURRENT !== null) {
         return clampChunkedUploadConcurrency(window.CHUNKED_UPLOAD_MAX_CONCURRENT);
     }
@@ -96,6 +100,27 @@ function resolveChunkedUploadConcurrency() {
     const persistedValue = getPersistedChunkedUploadConcurrency();
     if (persistedValue !== null) {
         return clampChunkedUploadConcurrency(persistedValue);
+    }
+
+    // Dynamic concurrency can be disabled from host page.
+    if (window.CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_ENABLED === false) {
+        return CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT;
+    }
+
+    const cached = getCachedChunkedUploadDynamicConcurrency();
+    if (cached !== null) {
+        const hints = resolveChunkedUploadBandwidthHints();
+        const normalizedCached = applyChunkedUploadPerfOnlyConcurrencyCap(cached, hints.networkHintMbps, hints.performanceHintMbps);
+        if (normalizedCached !== cached) {
+            cacheChunkedUploadDynamicConcurrency(normalizedCached);
+        }
+        return normalizedCached;
+    }
+
+    const resolvedDynamic = calculateChunkedUploadDynamicConcurrency();
+    if (resolvedDynamic !== null) {
+        cacheChunkedUploadDynamicConcurrency(resolvedDynamic);
+        return resolvedDynamic;
     }
 
     return CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT;
@@ -116,7 +141,12 @@ function resolveChunkedUploadLargeFilePilotThresholdMb() {
 
     const cached = getCachedChunkedUploadDynamicThresholdMb();
     if (cached !== null) {
-        return cached;
+        const hints = resolveChunkedUploadBandwidthHints();
+        const normalizedCached = applyChunkedUploadPerfOnlyThresholdCap(cached, hints.networkHintMbps, hints.performanceHintMbps);
+        if (normalizedCached !== cached) {
+            cacheChunkedUploadDynamicThresholdMb(normalizedCached);
+        }
+        return normalizedCached;
     }
 
     const resolvedDynamic = calculateChunkedUploadDynamicThresholdMb();
@@ -163,6 +193,15 @@ window.refreshChunkedUploadDynamicThresholdMb = function () {
 
 window.getChunkedUploadDynamicThresholdDiagnostics = function () {
     return buildChunkedUploadDynamicThresholdDiagnostics();
+};
+
+window.refreshChunkedUploadDynamicConcurrency = function () {
+    clearCachedChunkedUploadDynamicConcurrency();
+    return resolveChunkedUploadConcurrency();
+};
+
+window.getChunkedUploadDynamicConcurrencyDiagnostics = function () {
+    return buildChunkedUploadDynamicConcurrencyDiagnostics();
 };
 
 window.setChunkedUploadConcurrency = function (value) {
@@ -248,31 +287,34 @@ function mapChunkedUploadMbpsToThresholdMb(mbps) {
     return 2048;
 }
 
-function calculateChunkedUploadDynamicThresholdMb() {
-    const networkHint = readChunkedUploadNetworkDownlinkMbps();
-    const perfHint = readChunkedUploadPerformanceHintMbps();
-
-    let chosenMbps = null;
-    if (Number.isFinite(networkHint) && Number.isFinite(perfHint)) {
-        // Use conservative estimate to avoid over-thresholding on unstable links.
-        chosenMbps = Math.min(networkHint, perfHint);
-    } else if (Number.isFinite(networkHint)) {
-        chosenMbps = networkHint;
-    } else if (Number.isFinite(perfHint)) {
-        chosenMbps = perfHint;
+function applyChunkedUploadPerfOnlyThresholdCap(thresholdMb, networkHint, perfHint) {
+    let normalized = clampChunkedUploadLargeFilePilotThresholdMb(thresholdMb);
+    if (!Number.isFinite(networkHint) && Number.isFinite(perfHint)) {
+        normalized = Math.min(normalized, CHUNKED_UPLOAD_PERF_ONLY_THRESHOLD_MB_CAP);
     }
+    return normalized;
+}
+
+function applyChunkedUploadPerfOnlyConcurrencyCap(concurrency, networkHint, perfHint) {
+    let normalized = clampChunkedUploadConcurrency(concurrency);
+    if (!Number.isFinite(networkHint) && Number.isFinite(perfHint)) {
+        normalized = Math.min(normalized, CHUNKED_UPLOAD_PERF_ONLY_MAX_CONCURRENT_CAP);
+    }
+    return normalized;
+}
+
+function calculateChunkedUploadDynamicThresholdMb() {
+    const hints = resolveChunkedUploadBandwidthHints();
+    const networkHint = hints.networkHintMbps;
+    const perfHint = hints.performanceHintMbps;
+    const chosenMbps = hints.chosenMbps;
 
     if (!Number.isFinite(chosenMbps) || chosenMbps <= 0) {
         return null;
     }
 
     let mappedThreshold = clampChunkedUploadLargeFilePilotThresholdMb(mapChunkedUploadMbpsToThresholdMb(chosenMbps));
-
-    // When we only have performance-timing hints (no Network Information API),
-    // keep threshold conservative to avoid over-promoting async on noisy samples.
-    if (!Number.isFinite(networkHint) && Number.isFinite(perfHint)) {
-        mappedThreshold = Math.min(mappedThreshold, CHUNKED_UPLOAD_PERF_ONLY_THRESHOLD_MB_CAP);
-    }
+    mappedThreshold = applyChunkedUploadPerfOnlyThresholdCap(mappedThreshold, networkHint, perfHint);
 
     return mappedThreshold;
 }
@@ -288,24 +330,15 @@ function buildChunkedUploadDynamicThresholdDiagnostics() {
     const connectionDownlinkMbps = connection ? Number(connection.downlink || 0) : null;
     const connectionEffectiveType = connection ? String(connection.effectiveType || '') : '';
 
-    const networkHintMbps = readChunkedUploadNetworkDownlinkMbps();
-    const performanceHintMbps = readChunkedUploadPerformanceHintMbps();
-
-    let chosenMbps = null;
-    if (Number.isFinite(networkHintMbps) && Number.isFinite(performanceHintMbps)) {
-        chosenMbps = Math.min(networkHintMbps, performanceHintMbps);
-    } else if (Number.isFinite(networkHintMbps)) {
-        chosenMbps = networkHintMbps;
-    } else if (Number.isFinite(performanceHintMbps)) {
-        chosenMbps = performanceHintMbps;
-    }
+    const hints = resolveChunkedUploadBandwidthHints();
+    const networkHintMbps = hints.networkHintMbps;
+    const performanceHintMbps = hints.performanceHintMbps;
+    const chosenMbps = hints.chosenMbps;
 
     const mappedThresholdMb = (Number.isFinite(chosenMbps) && chosenMbps > 0)
         ? (function () {
             let mapped = clampChunkedUploadLargeFilePilotThresholdMb(mapChunkedUploadMbpsToThresholdMb(chosenMbps));
-            if (!Number.isFinite(networkHintMbps) && Number.isFinite(performanceHintMbps)) {
-                mapped = Math.min(mapped, CHUNKED_UPLOAD_PERF_ONLY_THRESHOLD_MB_CAP);
-            }
+            mapped = applyChunkedUploadPerfOnlyThresholdCap(mapped, networkHintMbps, performanceHintMbps);
             return mapped;
         }())
         : null;
@@ -365,6 +398,130 @@ function buildChunkedUploadDynamicThresholdDiagnostics() {
     };
 }
 
+function buildChunkedUploadDynamicConcurrencyDiagnostics() {
+    const configuredRaw = window.CHUNKED_UPLOAD_MAX_CONCURRENT;
+    const configuredParsed = parseInt(configuredRaw, 10);
+    const explicitOverride = (window.CHUNKED_UPLOAD_MAX_CONCURRENT !== undefined && window.CHUNKED_UPLOAD_MAX_CONCURRENT !== null)
+        ? clampChunkedUploadConcurrency(configuredParsed)
+        : null;
+
+    const persistedRaw = getPersistedChunkedUploadConcurrency();
+    const persistedParsed = parseInt(persistedRaw, 10);
+    const persistedConcurrency = (persistedRaw !== null && Number.isFinite(persistedParsed))
+        ? clampChunkedUploadConcurrency(persistedParsed)
+        : null;
+
+    const hints = resolveChunkedUploadBandwidthHints();
+    const networkHintMbps = hints.networkHintMbps;
+    const performanceHintMbps = hints.performanceHintMbps;
+    const chosenMbps = hints.chosenMbps;
+
+    const mappedConcurrency = (Number.isFinite(chosenMbps) && chosenMbps > 0)
+        ? (function () {
+            let mapped = clampChunkedUploadConcurrency(mapChunkedUploadMbpsToConcurrency(chosenMbps));
+            mapped = applyChunkedUploadPerfOnlyConcurrencyCap(mapped, networkHintMbps, performanceHintMbps);
+            return mapped;
+        }())
+        : null;
+
+    let cacheRaw = null;
+    let cacheUpdatedUtcMs = null;
+    let cacheAgeMs = null;
+    let cacheValid = false;
+    let cacheNormalized = null;
+    try {
+        cacheRaw = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_SESSION_KEY);
+        cacheUpdatedUtcMs = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_UPDATED_AT_SESSION_KEY);
+
+        if (cacheRaw && cacheUpdatedUtcMs) {
+            const updatedMs = Number(cacheUpdatedUtcMs);
+            const ageMs = Date.now() - updatedMs;
+            if (Number.isFinite(ageMs) && ageMs >= 0) {
+                cacheAgeMs = ageMs;
+                cacheValid = ageMs <= CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_TTL_MS;
+            }
+
+            const parsed = Number(cacheRaw);
+            if (Number.isFinite(parsed) && parsed > 0) {
+                cacheNormalized = clampChunkedUploadConcurrency(parsed);
+            }
+        }
+    } catch (e) {
+        // Ignore sessionStorage read issues.
+    }
+
+    return {
+        dynamicEnabled: window.CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_ENABLED !== false,
+        explicitOverride: explicitOverride,
+        persistedConcurrency: persistedConcurrency,
+        cache: {
+            raw: cacheRaw,
+            normalized: cacheNormalized,
+            updatedUtcMs: cacheUpdatedUtcMs,
+            ageMs: cacheAgeMs,
+            ttlMs: CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_TTL_MS,
+            valid: cacheValid
+        },
+        inputs: {
+            networkHintMbps: Number.isFinite(networkHintMbps) && networkHintMbps > 0 ? networkHintMbps : null,
+            performanceHintMbps: Number.isFinite(performanceHintMbps) && performanceHintMbps > 0 ? performanceHintMbps : null,
+            chosenMbps: Number.isFinite(chosenMbps) && chosenMbps > 0 ? chosenMbps : null
+        },
+        mapping: {
+            minConcurrent: 1,
+            maxConcurrent: 8,
+            perfOnlyCap: CHUNKED_UPLOAD_PERF_ONLY_MAX_CONCURRENT_CAP,
+            defaultConcurrent: CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT,
+            mappedConcurrent: mappedConcurrency
+        },
+        resolvedConcurrency: resolveChunkedUploadConcurrency()
+    };
+}
+
+function getCachedChunkedUploadDynamicConcurrency() {
+    try {
+        const raw = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_SESSION_KEY);
+        const updatedRaw = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_UPDATED_AT_SESSION_KEY);
+        if (!raw || !updatedRaw) return null;
+
+        const updated = Number(updatedRaw);
+        const ageMs = Date.now() - updated;
+        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_TTL_MS) {
+            clearCachedChunkedUploadDynamicConcurrency();
+            return null;
+        }
+
+        const parsed = Number(raw);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            clearCachedChunkedUploadDynamicConcurrency();
+            return null;
+        }
+
+        return clampChunkedUploadConcurrency(parsed);
+    } catch (e) {
+        return null;
+    }
+}
+
+function cacheChunkedUploadDynamicConcurrency(value) {
+    try {
+        const normalized = clampChunkedUploadConcurrency(value);
+        sessionStorage.setItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_SESSION_KEY, String(normalized));
+        sessionStorage.setItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_UPDATED_AT_SESSION_KEY, String(Date.now()));
+    } catch (e) {
+        // Ignore sessionStorage write issues.
+    }
+}
+
+function clearCachedChunkedUploadDynamicConcurrency() {
+    try {
+        sessionStorage.removeItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_SESSION_KEY);
+        sessionStorage.removeItem(CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_UPDATED_AT_SESSION_KEY);
+    } catch (e) {
+        // Ignore sessionStorage delete issues.
+    }
+}
+
 function getCachedChunkedUploadDynamicThresholdMb() {
     try {
         const raw = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_SESSION_KEY);
@@ -416,10 +573,13 @@ function installChunkedUploadDynamicThresholdRefresh() {
     }
 
     connection.addEventListener('change', function () {
-        if (window.CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_ENABLED === false) {
-            return;
+        if (window.CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_ENABLED !== false) {
+            clearCachedChunkedUploadDynamicThresholdMb();
         }
-        clearCachedChunkedUploadDynamicThresholdMb();
+
+        if (window.CHUNKED_UPLOAD_DYNAMIC_CONCURRENCY_ENABLED !== false) {
+            clearCachedChunkedUploadDynamicConcurrency();
+        }
     });
 }
 
@@ -3408,4 +3568,56 @@ if (window.__chunkedUploadRecordCreateClickHandlerInstalled !== true) {
 if (window.__chunkedUploadFormFieldChangeHandlerInstalled !== true) {
     document.addEventListener('change', handleChunkedUploadFormFieldChange, true);
     window.__chunkedUploadFormFieldChangeHandlerInstalled = true;
+}
+
+function resolveChunkedUploadBandwidthHints() {
+    const networkHintMbps = readChunkedUploadNetworkDownlinkMbps();
+    const performanceHintMbps = readChunkedUploadPerformanceHintMbps();
+
+    let chosenMbps = null;
+    if (Number.isFinite(networkHintMbps) && Number.isFinite(performanceHintMbps)) {
+        // Use conservative estimate to avoid over-thresholding on unstable links.
+        chosenMbps = Math.min(networkHintMbps, performanceHintMbps);
+    } else if (Number.isFinite(networkHintMbps)) {
+        chosenMbps = networkHintMbps;
+    } else if (Number.isFinite(performanceHintMbps)) {
+        chosenMbps = performanceHintMbps;
+    }
+
+    return {
+        networkHintMbps: networkHintMbps,
+        performanceHintMbps: performanceHintMbps,
+        chosenMbps: chosenMbps
+    };
+}
+
+function mapChunkedUploadMbpsToConcurrency(mbps) {
+    if (!Number.isFinite(mbps) || mbps <= 0) {
+        return CHUNKED_UPLOAD_DEFAULT_MAX_CONCURRENT;
+    }
+
+    if (mbps < 1) return 1;
+    if (mbps < 3) return 2;
+    if (mbps < 8) return 3;
+    if (mbps < 20) return 4;
+    if (mbps < 50) return 5;
+    if (mbps < 100) return 6;
+    if (mbps < 200) return 7;
+    return 8;
+}
+
+function calculateChunkedUploadDynamicConcurrency() {
+    const hints = resolveChunkedUploadBandwidthHints();
+    const networkHint = hints.networkHintMbps;
+    const perfHint = hints.performanceHintMbps;
+    const chosenMbps = hints.chosenMbps;
+
+    if (!Number.isFinite(chosenMbps) || chosenMbps <= 0) {
+        return null;
+    }
+
+    let mappedConcurrency = clampChunkedUploadConcurrency(mapChunkedUploadMbpsToConcurrency(chosenMbps));
+    mappedConcurrency = applyChunkedUploadPerfOnlyConcurrencyCap(mappedConcurrency, networkHint, perfHint);
+
+    return mappedConcurrency;
 }
