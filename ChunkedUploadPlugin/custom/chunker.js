@@ -33,6 +33,8 @@ let _chunkedUploadLastContextElement = null;
 let _chunkedUploadPendingSuggestedTitle = '';
 let _chunkedUploadPendingTitleContextElement = null;
 let _chunkedUploadPendingTitleSetAtUtc = 0;
+let _chunkedUploadPendingTitleApplyTimer = null;
+let _chunkedUploadPendingTitleObserver = null;
 
 function clampChunkedUploadConcurrency(value) {
     const parsed = parseInt(value, 10);
@@ -1014,12 +1016,13 @@ async function abortChunkedUploadSessionById(sessionId) {
 
         const originalSend = xhr.send.bind(xhr);
         xhr.send = function (body) {
+            let outboundBody = body;
             const isNativeFileUploadCall =
                 _method === 'POST' &&
                 isChunkedUploadNativePostFormDataUrl(_url);
 
             if (isNativeFileUploadCall) {
-                const intercepted = tryInterceptChunkedUploadNativeFormDataBody(body);
+                const intercepted = tryInterceptChunkedUploadNativeFormDataBody(outboundBody);
                 if (intercepted) {
                     logDebug('[ChunkedUpload] Intercepted native PostFormData upload and delegated to chunked flow.');
                     return;
@@ -1031,11 +1034,36 @@ async function abortChunkedUploadSessionById(sessionId) {
                 (/\/ServiceApi\/Record\b/i.test(_url) || /\/ServiceApi\/RecordCheckIn\b/i.test(_url) || /\/ServiceApi\/Record\/\d+\/CheckIn\b/i.test(_url));
 
             if (isRecordSaveCall) {
+                ensureChunkedUploadTitleBeforeSubmit(_chunkedUploadPendingTitleContextElement || _chunkedUploadLastContextElement || document.body);
+                outboundBody = enforceChunkedUploadTitleInRecordSaveBody(outboundBody);
                 xhr.addEventListener('load', async function () {
                     try {
                         const isGatewayTimeout = xhr.status === 504 || xhr.status === 524;
 
                         if (xhr.status < 200 || xhr.status >= 300) {
+                            const responseText = String(xhr.responseText || '').trim();
+                            if (responseText) {
+                                let parsed = null;
+                                try {
+                                    parsed = JSON.parse(responseText);
+                                } catch (e) {
+                                    parsed = null;
+                                }
+
+                                if (parsed && parsed.ResponseStatus) {
+                                    console.error('[ChunkedUpload] Record save failed:', {
+                                        httpStatus: xhr.status,
+                                        errorCode: parsed.ResponseStatus.ErrorCode || '',
+                                        message: parsed.ResponseStatus.Message || '',
+                                        stackTrace: parsed.ResponseStatus.StackTrace || ''
+                                    });
+                                } else {
+                                    console.error(`[ChunkedUpload] Record save failed (HTTP ${xhr.status}) body:`, responseText.slice(0, 1200));
+                                }
+                            } else {
+                                console.error(`[ChunkedUpload] Record save failed (HTTP ${xhr.status}) with empty response body.`);
+                            }
+
                             if (isGatewayTimeout) {
                                 // CM record save timed out at the proxy — the server likely completed
                                 // the save but the response was dropped. We cannot verify the hash
@@ -1047,7 +1075,7 @@ async function abortChunkedUploadSessionById(sessionId) {
                                 let pending = null;
                                 let matchedKey = null;
                                 for (const key of pendingKeys) {
-                                    if (typeof body === 'string' && body.includes(key.replace(/\\/g, '\\\\'))) {
+                                    if (typeof outboundBody === 'string' && outboundBody.includes(key.replace(/\\/g, '\\\\'))) {
                                         pending = _chunkedUploadPendingOps[key];
                                         matchedKey = key;
                                         break;
@@ -1081,7 +1109,7 @@ async function abortChunkedUploadSessionById(sessionId) {
                         let pending = null;
                         let matchedKey = null;
                         for (const key of pendingKeys) {
-                            if (typeof body === 'string' && body.includes(key.replace(/\\/g, '\\\\'))) {
+                            if (typeof outboundBody === 'string' && outboundBody.includes(key.replace(/\\/g, '\\\\'))) {
                                 pending = _chunkedUploadPendingOps[key];
                                 matchedKey = key;
                                 break;
@@ -1096,6 +1124,7 @@ async function abortChunkedUploadSessionById(sessionId) {
                         if (!pending) return;
 
                         unregisterPendingUpload(matchedKey, pending);
+                        clearChunkedUploadSuggestedTitle();
 
                         if (pending.isLargeFilePilotCandidate === true) {
                             try {
@@ -1117,7 +1146,7 @@ async function abortChunkedUploadSessionById(sessionId) {
                     }
                 });
             }
-            return originalSend.apply(xhr, arguments);
+            return originalSend.call(xhr, outboundBody);
         };
 
         return xhr;
@@ -2259,12 +2288,83 @@ function rememberChunkedUploadSuggestedTitle(file, contextElement) {
     _chunkedUploadPendingSuggestedTitle = suggested;
     _chunkedUploadPendingTitleContextElement = contextElement || null;
     _chunkedUploadPendingTitleSetAtUtc = Date.now();
+    ensureChunkedUploadPendingTitleObserver();
+    scheduleChunkedUploadPendingTitleApply(contextElement || _chunkedUploadLastContextElement || document.body);
 }
 
 function clearChunkedUploadSuggestedTitle() {
+    if (_chunkedUploadPendingTitleApplyTimer) {
+        clearTimeout(_chunkedUploadPendingTitleApplyTimer);
+        _chunkedUploadPendingTitleApplyTimer = null;
+    }
+    if (_chunkedUploadPendingTitleObserver) {
+        try {
+            _chunkedUploadPendingTitleObserver.disconnect();
+        } catch (e) {
+            // Ignore observer disconnect errors.
+        }
+        _chunkedUploadPendingTitleObserver = null;
+    }
+
     _chunkedUploadPendingSuggestedTitle = '';
     _chunkedUploadPendingTitleContextElement = null;
     _chunkedUploadPendingTitleSetAtUtc = 0;
+}
+
+function scheduleChunkedUploadPendingTitleApply(contextElement) {
+    if (!_chunkedUploadPendingSuggestedTitle) {
+        return;
+    }
+
+    if (_chunkedUploadPendingTitleApplyTimer) {
+        clearTimeout(_chunkedUploadPendingTitleApplyTimer);
+        _chunkedUploadPendingTitleApplyTimer = null;
+    }
+
+    const context = contextElement || _chunkedUploadPendingTitleContextElement || _chunkedUploadLastContextElement || document.body;
+    _chunkedUploadPendingTitleApplyTimer = setTimeout(function () {
+        _chunkedUploadPendingTitleApplyTimer = null;
+        ensureChunkedUploadTitleBeforeSubmit(context);
+    }, 120);
+}
+
+function ensureChunkedUploadPendingTitleObserver() {
+    if (_chunkedUploadPendingTitleObserver) {
+        return;
+    }
+
+    if (typeof MutationObserver === 'undefined') {
+        return;
+    }
+
+    const startObserver = function () {
+        if (!document.body) {
+            return false;
+        }
+
+        _chunkedUploadPendingTitleObserver = new MutationObserver(function () {
+            if (!_chunkedUploadPendingSuggestedTitle) {
+                return;
+            }
+            scheduleChunkedUploadPendingTitleApply(_chunkedUploadPendingTitleContextElement || _chunkedUploadLastContextElement || document.body);
+        });
+
+        _chunkedUploadPendingTitleObserver.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        return true;
+    };
+
+    if (startObserver()) {
+        return;
+    }
+
+    document.addEventListener('DOMContentLoaded', function onReady() {
+        document.removeEventListener('DOMContentLoaded', onReady);
+        startObserver();
+    });
 }
 
 function findChunkedUploadTitleElement(contextElement, options) {
@@ -2334,7 +2434,13 @@ function findChunkedUploadTitleElement(contextElement, options) {
                 control.className
             ].join(' ').toLowerCase();
 
-            if (attrs.indexOf('title') >= 0 || attrs.indexOf('free text') >= 0 || attrs.indexOf('freetext') >= 0) {
+            const isExplicitTitleField =
+                attrs.indexOf('recordtitle') >= 0 ||
+                attrs.indexOf('recordtypedtitle') >= 0 ||
+                attrs.indexOf('freetexttitle') >= 0 ||
+                attrs.indexOf('title (free text part)') >= 0;
+
+            if (isExplicitTitleField) {
                 if (!firstMatch) {
                     firstMatch = control;
                 }
@@ -2454,6 +2560,12 @@ function ensureChunkedUploadTitleBeforeSubmit(formElement) {
             ''
         ).trim();
 
+        // If title already exists in CM's form model, do not touch any DOM fields.
+        // This prevents deferred reapply from accidentally filling unrelated inputs.
+        if (currentVmTitle) {
+            return;
+        }
+
         if (!currentVmTitle && applyChunkedUploadTitleViaRecordFormVm(recordFormVm, _chunkedUploadPendingSuggestedTitle)) {
             logDebug(`[ChunkedUpload] Restored pending title via RecordDataEntryForm VM before submit: "${_chunkedUploadPendingSuggestedTitle}"`);
             return;
@@ -2474,6 +2586,180 @@ function ensureChunkedUploadTitleBeforeSubmit(formElement) {
     if (applied) {
         logDebug(`[ChunkedUpload] Restored pending title before submit: "${_chunkedUploadPendingSuggestedTitle}"`);
     }
+}
+
+const handleChunkedUploadRecordCreateClick = function (event) {
+    const createButton = event && event.target && event.target.closest
+        ? event.target.closest('#saveBtn, button#saveBtn, button[data-bind*="submit"], .btn-primary')
+        : null;
+
+    if (!createButton) return;
+
+    const formElement = createButton.closest('form') || _chunkedUploadPendingTitleContextElement || _chunkedUploadLastContextElement || document.body;
+    ensureChunkedUploadTitleBeforeSubmit(formElement);
+};
+
+const handleChunkedUploadFormFieldChange = function (event) {
+    if (!_chunkedUploadPendingSuggestedTitle) {
+        return;
+    }
+
+    const target = event && event.target && event.target.nodeType === 1 ? event.target : null;
+    if (!target) {
+        return;
+    }
+
+    if (target.matches && target.matches('input[type="file"], input[name="files[]"], input[name="file"]')) {
+        return;
+    }
+
+    scheduleChunkedUploadPendingTitleApply(target);
+};
+
+function applyChunkedUploadTitleToPayloadObject(payload, suggestedTitle) {
+    if (!payload || typeof payload !== 'object' || !suggestedTitle) {
+        return false;
+    }
+
+    let changed = false;
+    const keys = ['RecordTitle', 'RecordTypedTitle', 'freeTextTitle'];
+
+    const setIfBlank = function (key) {
+        const current = payload[key];
+
+        if (current === undefined || current === null || current === '') {
+            payload[key] = suggestedTitle;
+            return true;
+        }
+
+        if (typeof current === 'string') {
+            if (!current.trim()) {
+                payload[key] = suggestedTitle;
+                return true;
+            }
+            return false;
+        }
+
+        if (typeof current === 'object') {
+            if ('Value' in current && (!current.Value || !String(current.Value).trim())) {
+                current.Value = suggestedTitle;
+                return true;
+            }
+            if ('NameString' in current && (!current.NameString || !String(current.NameString).trim())) {
+                current.NameString = suggestedTitle;
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    for (let i = 0; i < keys.length; i++) {
+        if (setIfBlank(keys[i])) {
+            changed = true;
+        }
+    }
+
+    if (!('RecordTitle' in payload) && !('RecordTypedTitle' in payload) && !('freeTextTitle' in payload)) {
+        payload.RecordTitle = suggestedTitle;
+        changed = true;
+    }
+
+    return changed;
+}
+
+function resolveChunkedUploadPendingForPayload(payloadText) {
+    const pendingKeys = Object.keys(_chunkedUploadPendingOps || {});
+    if (!pendingKeys.length) return null;
+
+    // Prefer exact payload token match when available.
+    if (typeof payloadText === 'string' && payloadText) {
+        for (let i = 0; i < pendingKeys.length; i++) {
+            const key = pendingKeys[i];
+            if (payloadText.includes(key.replace(/\\/g, '\\\\')) || payloadText.includes(key)) {
+                return {
+                    uploadedFileName: key,
+                    pending: _chunkedUploadPendingOps[key]
+                };
+            }
+        }
+    }
+
+    if (pendingKeys.length === 1) {
+        const key = pendingKeys[0];
+        return {
+            uploadedFileName: key,
+            pending: _chunkedUploadPendingOps[key]
+        };
+    }
+
+    return null;
+}
+
+function applyChunkedUploadFilePayloadObject(payload, payloadText) {
+    if (!payload || typeof payload !== 'object') return false;
+
+    const resolved = resolveChunkedUploadPendingForPayload(payloadText);
+    if (!resolved || !resolved.pending) return false;
+
+    const pending = resolved.pending;
+    if (pending.isLargeFilePilotCandidate === true) {
+        // Large-file pilot intentionally avoids native attach payload.
+        return false;
+    }
+
+    const uploadedFileName = String(resolved.uploadedFileName || '').trim();
+    if (!uploadedFileName) return false;
+
+    let changed = false;
+    const existingRecordFilePath = String(payload.RecordFilePath || '').trim();
+    const existingFromFileName = String(payload.fromFileName || '').trim();
+
+    if (!existingRecordFilePath) {
+        payload.RecordFilePath = uploadedFileName;
+        changed = true;
+    }
+
+    if (!existingFromFileName && pending.originalFileName) {
+        payload.fromFileName = pending.originalFileName;
+        changed = true;
+    }
+
+    return changed;
+}
+
+function enforceChunkedUploadTitleInRecordSaveBody(body) {
+    const suggested = String(_chunkedUploadPendingSuggestedTitle || '').trim();
+    if (!body) {
+        return body;
+    }
+
+    if (typeof body === 'string') {
+        const trimmed = body.trim();
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            try {
+                const parsed = JSON.parse(body);
+                const titleChanged = suggested ? applyChunkedUploadTitleToPayloadObject(parsed, suggested) : false;
+                const fileChanged = applyChunkedUploadFilePayloadObject(parsed, body);
+                if (titleChanged || fileChanged) {
+                    return JSON.stringify(parsed);
+                }
+            } catch (e) {
+                // Ignore JSON parse errors and keep original body.
+            }
+        }
+        return body;
+    }
+
+    if (typeof body === 'object') {
+        if (suggested) {
+            applyChunkedUploadTitleToPayloadObject(body, suggested);
+        }
+        applyChunkedUploadFilePayloadObject(body, '');
+        return body;
+    }
+
+    return body;
 }
 
 function hideChunkedUploadProgressMessageDom() {
@@ -2828,4 +3114,14 @@ if (window.__chunkedUploadDeleteHandlerInstalled !== true) {
     document.addEventListener('click', handleChunkedUploadDeleteConfirmOkClick, true);
     document.addEventListener('click', handleChunkedUploadDeleteConfirmCancelClick, true);
     window.__chunkedUploadDeleteHandlerInstalled = true;
+}
+
+if (window.__chunkedUploadRecordCreateClickHandlerInstalled !== true) {
+    document.addEventListener('click', handleChunkedUploadRecordCreateClick, true);
+    window.__chunkedUploadRecordCreateClickHandlerInstalled = true;
+}
+
+if (window.__chunkedUploadFormFieldChangeHandlerInstalled !== true) {
+    document.addEventListener('change', handleChunkedUploadFormFieldChange, true);
+    window.__chunkedUploadFormFieldChangeHandlerInstalled = true;
 }
