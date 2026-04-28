@@ -62,6 +62,33 @@ Probe status:
 - Current dynamic logic uses Network Information API and performance timing hints with conservative perf-only caps.
 - Revisit probe implementation only if Azure validation shows unstable hint quality or repeated misclassification.
 
+### Azure WC validation snapshots (2026-04-28)
+
+#### Run 1 — perf-only conditions (no Network Information API)
+
+- External speed test: ~300 Mbps upload.
+- `networkHintMbps`: null (Network Information API unavailable)
+- `performanceHintMbps`: ~11.67
+- `chosenMbps`: ~11.67
+- `resolvedThresholdMb`: 1024 (perf-only cap applied)
+- `resolvedConcurrency`: 4 (perf-only cap applied)
+
+#### Run 2 — Network Information API available (4g effective type)
+
+- External speed test: ~500 Mbps down / ~12 Mbps up.
+- `networkHintMbps`: 9 (browser-capped — Chrome clamps `downlink` to ~10 Mbps max regardless of actual speed)
+- `performanceHintMbps`: ~79.58 (reflects download speed, not upload)
+- `chosenMbps`: 9 (conservative min of both hints)
+- `resolvedThresholdMb`: 1024
+- `resolvedConcurrency`: 4
+
+Interpretation:
+
+- Both runs produced sensible, stable results.
+- The conservative `Math.min` correctly preferred the upload-side hint over the inflated download-side perf timing.
+- Browser privacy clamping on the Network Information API is expected behaviour — Chrome caps `downlink` at ~10 Mbps for 4g regardless of actual link speed. This limits the ceiling of Network API-informed tuning but keeps results conservative and consistent.
+- No tiny upload probe is required at this stage.
+
 ### Async attach operations notes
 
 The async attach flow is now validated for simultaneous jobs and includes operational UI behavior for better visibility.

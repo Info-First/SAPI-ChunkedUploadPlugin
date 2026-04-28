@@ -1336,6 +1336,27 @@ async function startChunkedUploadAsyncAttach(pending, recordUri) {
     return await res.json();
 }
 
+async function preflightChunkedUploadAsyncAttach(pending) {
+    const formData = createFormDataWithCsrf();
+    formData.append('SessionId', pending.sessionId || '');
+    formData.append('FullUploadedFileName', pending.fullUploadedFileName || '');
+    formData.append('StagedFilePath', pending.stagedFilePath || '');
+
+    const res = await fetch(buildUploadRoute('attach/preflight'), {
+        method: 'POST',
+        credentials: 'include',
+        headers: JSON_ACCEPT_HEADERS,
+        body: formData
+    });
+
+    if (!res.ok) {
+        const body = await res.text();
+        throw createChunkedUploadHttpError('Failed to preflight async attach', res.status, body);
+    }
+
+    return await res.json();
+}
+
 async function pollChunkedUploadAsyncAttach(jobId, timeoutMs, onStatus) {
     const started = Date.now();
     const maxDuration = timeoutMs > 0 ? timeoutMs : (30 * 60 * 1000);
@@ -1419,6 +1440,90 @@ async function runChunkedUploadAsyncAttach(pending, recordUri) {
     }
 }
 
+async function canProceedWithChunkedUploadRecordSave(pending) {
+    if (!pending || pending.isLargeFilePilotCandidate !== true) {
+        return { allow: true, reason: '' };
+    }
+
+    const sessionId = String(pending.sessionId || '').trim();
+    if (!isValidChunkedUploadSessionId(sessionId)) {
+        return {
+            allow: false,
+            reason: 'Upload session is missing or invalid. Please re-upload the file before saving the record.'
+        };
+    }
+
+    try {
+        const preflight = await preflightChunkedUploadAsyncAttach(pending);
+        if (preflight && preflight.SourcePathAllowed === false) {
+            return {
+                allow: false,
+                reason: 'Upload source file is outside the allowed attach path. Please re-upload the file before saving the record.'
+            };
+        }
+
+        if (preflight && preflight.SourceExists === false) {
+            return {
+                allow: false,
+                reason: 'Upload source file was not found or expired. Please re-upload the file before saving the record.'
+            };
+        }
+
+        return { allow: true, reason: '' };
+    } catch (e) {
+        const status = Number(e && e.httpStatus || 0);
+        const errorCode = String(e && e.errorCode || '').toLowerCase();
+        if (status === 404 || status === 410 || status === 400 || errorCode === 'notfound') {
+            return {
+                allow: false,
+                reason: 'Upload session was not found or expired. Please re-upload the file before saving the record.'
+            };
+        }
+
+        // Do not block save on transient probe failures.
+        return { allow: true, reason: '' };
+    }
+}
+
+function shouldRollbackChunkedUploadRecordAfterAttachFailure(error) {
+    return !isChunkedUploadAsyncAttachRetryableError(error);
+}
+
+async function tryRollbackChunkedUploadCreatedRecord(recordUri, error) {
+    const numericUri = Number(recordUri || 0);
+    if (!Number.isFinite(numericUri) || numericUri <= 0) {
+        return { attempted: false, deleted: false, reason: 'No record URI available.' };
+    }
+
+    if (!shouldRollbackChunkedUploadRecordAfterAttachFailure(error)) {
+        return { attempted: false, deleted: false, reason: 'Attach failure is retryable.' };
+    }
+
+    try {
+        const res = await fetch(`${SERVICE_API_BASE_URL}/Record/${numericUri}`, {
+            method: 'DELETE',
+            credentials: 'include',
+            headers: JSON_ACCEPT_HEADERS
+        });
+
+        if (res.ok || res.status === 404) {
+            return { attempted: true, deleted: true, reason: '' };
+        }
+
+        return {
+            attempted: true,
+            deleted: false,
+            reason: `Rollback delete failed (HTTP ${res.status}).`
+        };
+    } catch (e) {
+        return {
+            attempted: true,
+            deleted: false,
+            reason: e && e.message ? String(e.message) : 'Rollback delete failed.'
+        };
+    }
+}
+
 async function abortChunkedUploadSessionById(sessionId) {
     if (!sessionId) return;
 
@@ -1435,6 +1540,33 @@ async function abortChunkedUploadSessionById(sessionId) {
     } catch (e) {
         logDebug('Abort session call failed:', e);
     }
+}
+
+function resolvePendingChunkedUploadForSaveBody(outboundBody) {
+    const pendingKeys = Object.keys(_chunkedUploadPendingOps);
+    if (!pendingKeys.length) {
+        return { pending: null, matchedKey: null };
+    }
+
+    let pending = null;
+    let matchedKey = null;
+    for (const key of pendingKeys) {
+        if (typeof outboundBody === 'string' && outboundBody.includes(key.replace(/\\/g, '\\\\'))) {
+            pending = _chunkedUploadPendingOps[key];
+            matchedKey = key;
+            break;
+        }
+    }
+
+    if (!pending && pendingKeys.length === 1) {
+        matchedKey = pendingKeys[0];
+        pending = _chunkedUploadPendingOps[matchedKey];
+    }
+
+    return {
+        pending: pending,
+        matchedKey: matchedKey
+    };
 }
 
 (function installSaveInterceptor() {
@@ -1476,10 +1608,137 @@ async function abortChunkedUploadSessionById(sessionId) {
             const isRecordSaveCall =
                 _method === 'POST' &&
                 (/\/ServiceApi\/Record\b/i.test(_url) || /\/ServiceApi\/RecordCheckIn\b/i.test(_url) || /\/ServiceApi\/Record\/\d+\/CheckIn\b/i.test(_url));
+            const isRecordCheckInCall =
+                _method === 'POST' &&
+                (/\/ServiceApi\/RecordCheckIn\b/i.test(_url) || /\/ServiceApi\/Record\/\d+\/CheckIn\b/i.test(_url));
+            const isRecordCreateCall =
+                _method === 'POST' &&
+                /\/ServiceApi\/Record\b/i.test(_url) &&
+                !isRecordCheckInCall;
 
             if (isRecordSaveCall) {
                 ensureChunkedUploadTitleBeforeSubmit(_chunkedUploadPendingTitleContextElement || _chunkedUploadLastContextElement || document.body);
                 outboundBody = enforceChunkedUploadTitleInRecordSaveBody(outboundBody);
+
+                const preSaveMatch = resolvePendingChunkedUploadForSaveBody(outboundBody);
+                if (preSaveMatch.pending && preSaveMatch.pending.isLargeFilePilotCandidate === true) {
+                    (async function () {
+                        const gate = await canProceedWithChunkedUploadRecordSave(preSaveMatch.pending);
+                        if (!gate.allow) {
+                            try {
+                                if (preSaveMatch.pending.fileCacheKey) {
+                                    localStorage.removeItem(preSaveMatch.pending.fileCacheKey);
+                                }
+                            } catch (e) {
+                                // Ignore localStorage cleanup issues.
+                            }
+
+                            unregisterPendingUpload(preSaveMatch.matchedKey, preSaveMatch.pending);
+                            updateAsyncAttachBadgeForPending(preSaveMatch.pending, 'failed', gate.reason);
+                            alert(`Cannot create record with metadata only. ${gate.reason}`);
+                            return;
+                        }
+
+                        xhr.addEventListener('load', async function () {
+                            try {
+                                const isGatewayTimeout = xhr.status === 504 || xhr.status === 524;
+
+                                if (xhr.status < 200 || xhr.status >= 300) {
+                                    const responseText = String(xhr.responseText || '').trim();
+                                    if (responseText) {
+                                        let parsed = null;
+                                        try {
+                                            parsed = JSON.parse(responseText);
+                                        } catch (e) {
+                                            parsed = null;
+                                        }
+
+                                        if (parsed && parsed.ResponseStatus) {
+                                            console.error('[ChunkedUpload] Record save failed:', {
+                                                httpStatus: xhr.status,
+                                                errorCode: parsed.ResponseStatus.ErrorCode || '',
+                                                message: parsed.ResponseStatus.Message || '',
+                                                stackTrace: parsed.ResponseStatus.StackTrace || ''
+                                            });
+                                        } else {
+                                            console.error(`[ChunkedUpload] Record save failed (HTTP ${xhr.status}) body:`, responseText.slice(0, 1200));
+                                        }
+                                    } else {
+                                        console.error(`[ChunkedUpload] Record save failed (HTTP ${xhr.status}) with empty response body.`);
+                                    }
+
+                                    if (isGatewayTimeout) {
+                                        // CM record save timed out at the proxy — the server likely completed
+                                        // the save but the response was dropped. We cannot verify the hash
+                                        // (no URI in response), but we can still clean up staged artifacts
+                                        // to prevent chunks lingering on disk.
+                                        const gatewayTimeoutMatch = resolvePendingChunkedUploadForSaveBody(outboundBody);
+                                        const pending = gatewayTimeoutMatch.pending;
+                                        const matchedKey = gatewayTimeoutMatch.matchedKey;
+                                        if (!pending) return;
+
+                                        console.warn(`[ChunkedUpload] Record save returned HTTP ${xhr.status}. Skipping hash verification; attempting cleanup of staged artifacts.`);
+                                        unregisterPendingUpload(matchedKey, pending);
+                                        await cleanupChunkedUpload(pending);
+
+                                        if (pending.isLargeFilePilotCandidate === true) {
+                                            notifyChunkedUploadLargeFileTimeoutRecovery(pending, xhr.status);
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                const data = JSON.parse(xhr.responseText);
+                                if (!data || !data.Results || !data.Results.length) return;
+                                const uri = data.Results[0].Uri;
+                                if (!uri) return;
+
+                                const postSaveMatch = resolvePendingChunkedUploadForSaveBody(outboundBody);
+                                const pending = postSaveMatch.pending;
+                                const matchedKey = postSaveMatch.matchedKey;
+                                if (!pending) return;
+
+                                unregisterPendingUpload(matchedKey, pending);
+                                clearChunkedUploadSuggestedTitle();
+
+                                if (pending.isLargeFilePilotCandidate === true) {
+                                    try {
+                                        await runChunkedUploadAsyncAttach(pending, uri);
+                                    } catch (attachError) {
+                                        console.error('[ChunkedUpload] Async attach failed:', attachError);
+
+                                        if (isRecordCreateCall === true) {
+                                            const rollback = await tryRollbackChunkedUploadCreatedRecord(uri, attachError);
+                                            if (rollback.deleted === true) {
+                                                alert(`Large-file async attach failed and the new record was rolled back to prevent a metadata-only record. ${attachError.message || attachError}`);
+                                            } else {
+                                                const rollbackDetail = rollback.attempted
+                                                    ? ` Rollback could not be completed automatically: ${rollback.reason || 'unknown error'}.`
+                                                    : '';
+                                                alert(`Large-file async attach failed: ${attachError.message || attachError}.${rollbackDetail}`);
+                                            }
+                                        } else {
+                                            alert(`Large-file async attach failed: ${attachError.message || attachError}`);
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                if (pending.expectedHash) {
+                                    await verifyDocumentHash(uri, pending.expectedHash);
+                                }
+
+                                await cleanupChunkedUpload(pending);
+                            } catch (e) {
+                                console.warn('Post-save hash verification error:', e);
+                            }
+                        });
+
+                        return originalSend.call(xhr, outboundBody);
+                    })();
+                    return;
+                }
+
                 xhr.addEventListener('load', async function () {
                     try {
                         const isGatewayTimeout = xhr.status === 504 || xhr.status === 524;

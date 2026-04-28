@@ -109,6 +109,15 @@ namespace HP.HPTRIM.ServiceAPI
         public string Comments { get; set; }
     }
 
+    [Route("/Upload/attach/preflight", "POST")]
+    [Authenticate]
+    public class PreflightAsyncAttach : IReturn<PreflightAsyncAttachResponse>
+    {
+        public string SessionId { get; set; }
+        public string FullUploadedFileName { get; set; }
+        public string StagedFilePath { get; set; }
+    }
+
     [Route("/Upload/attach/{JobId}", "GET")]
     [Authenticate]
     public class GetAsyncAttachStatus : IReturn<GetAsyncAttachStatusResponse>
@@ -217,6 +226,15 @@ namespace HP.HPTRIM.ServiceAPI
         public string JobId { get; set; }
         public string StatusUrl { get; set; }
         public DateTime CreatedUtc { get; set; }
+        public ResponseStatus ResponseStatus { get; set; }
+    }
+
+    public class PreflightAsyncAttachResponse : IHasResponseStatus
+    {
+        public string SessionId { get; set; }
+        public string SourcePath { get; set; }
+        public bool SourceExists { get; set; }
+        public bool SourcePathAllowed { get; set; }
         public ResponseStatus ResponseStatus { get; set; }
     }
 
@@ -641,6 +659,33 @@ namespace HP.HPTRIM.ServiceAPI
             };
         }
 
+        public object Post(PreflightAsyncAttach request)
+        {
+            if (request == null)
+            {
+                throw HttpError.BadRequest("Request body is required.");
+            }
+
+            if (string.IsNullOrWhiteSpace(request.SessionId))
+            {
+                throw HttpError.BadRequest("SessionId is required.");
+            }
+
+            var session = sessionStore.GetRequiredSession(request.SessionId);
+            var sourcePath = ResolveAsyncAttachSourcePath(request.FullUploadedFileName, request.StagedFilePath, session);
+            var sourcePathAllowed = IsPathUnderAllowedRoot(sourcePath, ResolveUploadBasePath());
+            var sourceExists = sourcePathAllowed && File.Exists(sourcePath);
+
+            return new PreflightAsyncAttachResponse
+            {
+                SessionId = session.SessionId,
+                SourcePath = sourcePath,
+                SourceExists = sourceExists,
+                SourcePathAllowed = sourcePathAllowed,
+                ResponseStatus = new ResponseStatus()
+            };
+        }
+
         public object Get(GetAsyncAttachStatus request)
         {
             if (request == null || string.IsNullOrWhiteSpace(request.JobId))
@@ -803,14 +848,19 @@ namespace HP.HPTRIM.ServiceAPI
 
         private string ResolveAsyncAttachSourcePath(StartAsyncAttach request, UploadSessionState session)
         {
-            if (!string.IsNullOrWhiteSpace(request.FullUploadedFileName))
+            return ResolveAsyncAttachSourcePath(request.FullUploadedFileName, request.StagedFilePath, session);
+        }
+
+        private string ResolveAsyncAttachSourcePath(string fullUploadedFileName, string stagedFilePath, UploadSessionState session)
+        {
+            if (!string.IsNullOrWhiteSpace(fullUploadedFileName))
             {
-                return request.FullUploadedFileName;
+                return fullUploadedFileName;
             }
 
-            if (!string.IsNullOrWhiteSpace(request.StagedFilePath))
+            if (!string.IsNullOrWhiteSpace(stagedFilePath))
             {
-                return request.StagedFilePath;
+                return stagedFilePath;
             }
 
             var sessionDirectory = Path.Combine(ResolveChunkRootPath(), session.SessionId);
