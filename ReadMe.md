@@ -10,84 +10,45 @@ This project adds a custom Content Manager ServiceAPI plugin that supports resum
 - Reassembles the file server-side.
 - Checks the assembled file into the target Content Manager record.
 - Supports upload status queries and upload cancellation.
-- Includes a large-file async-attach pilot path in the Web Client script to recover from proxy timeouts on CM save calls.
+- Includes a large-file async-attach path in the Web Client script to recover from proxy timeouts on CM save calls.
 - Includes runtime debug logging controls for browser-side diagnostics.
 
-## Large-file async-attach pilot behavior
+## Large-file async-attach behavior
 
 The Web Client integration script now includes a pilot behavior for very large files.
 
-- Pilot threshold default: 256 MB.
+- Async-attach threshold is fixed at 256 MB.
 - Files smaller than the threshold continue to use the normal flow.
-- Files at or above the threshold are flagged as pilot candidates.
+- Files at or above the threshold are flagged as async candidates.
 - If CM native save returns HTTP 504 or 524 after chunk upload has completed, the script:
   - cleans up staged/session artifacts,
   - shows a user-facing timeout recovery message,
   - refreshes the page to clear the stuck spinner.
 
-This pilot is designed to improve reliability behind reverse proxies (for example Cloudflare) while preserving current behavior for smaller uploads.
+This flow is designed to improve reliability behind reverse proxies (for example Cloudflare) while preserving current behavior for smaller uploads.
 
-Runtime threshold controls in browser console:
+Runtime threshold check in browser console:
 
 ```javascript
-window.setChunkedUploadLargeFilePilotThresholdMb(1024);
 window.getChunkedUploadLargeFilePilotThresholdMb();
 ```
 
-### Dynamic threshold and concurrency tuning
+### Dynamic concurrency tuning
 
-The Web Client script can derive runtime values from browser network/performance hints when explicit overrides are not set.
+The Web Client script can derive runtime concurrency from browser upload/performance hints when explicit overrides are not set.
 
-- Threshold resolution order: explicit override -> dynamic cached value -> computed dynamic value -> default (256 MB).
 - Concurrency resolution order: explicit override -> persisted user setting -> dynamic cached value -> computed dynamic value -> default (4).
-- Dynamic values are cached in session storage for 30 minutes.
-- Threshold guardrails: min 128 MB, max 2048 MB.
-- Performance-only threshold path is capped at 1024 MB when Network Information API hints are unavailable.
+- Dynamic concurrency values are cached in session storage for 30 minutes.
 - Dynamic concurrency guardrails: min 1, max 8.
 - Performance-only concurrency path is capped at 4 when Network Information API hints are unavailable.
 
 Runtime diagnostics and refresh helpers:
 
 ```javascript
-window.getChunkedUploadDynamicThresholdDiagnostics();
-window.refreshChunkedUploadDynamicThresholdMb();
 window.getChunkedUploadDynamicConcurrencyDiagnostics();
 window.refreshChunkedUploadDynamicConcurrency();
 window.getChunkedUploadConcurrency();
 ```
-
-Probe status:
-
-- Tiny upload probe is intentionally deferred.
-- Current dynamic logic uses Network Information API and performance timing hints with conservative perf-only caps.
-- Revisit probe implementation only if Azure validation shows unstable hint quality or repeated misclassification.
-
-### Azure WC validation snapshots (2026-04-28)
-
-#### Run 1 — perf-only conditions (no Network Information API)
-
-- External speed test: ~300 Mbps upload.
-- `networkHintMbps`: null (Network Information API unavailable)
-- `performanceHintMbps`: ~11.67
-- `chosenMbps`: ~11.67
-- `resolvedThresholdMb`: 1024 (perf-only cap applied)
-- `resolvedConcurrency`: 4 (perf-only cap applied)
-
-#### Run 2 — Network Information API available (4g effective type)
-
-- External speed test: ~500 Mbps down / ~12 Mbps up.
-- `networkHintMbps`: 9 (browser-capped — Chrome clamps `downlink` to ~10 Mbps max regardless of actual speed)
-- `performanceHintMbps`: ~79.58 (reflects download speed, not upload)
-- `chosenMbps`: 9 (conservative min of both hints)
-- `resolvedThresholdMb`: 1024
-- `resolvedConcurrency`: 4
-
-Interpretation:
-
-- Both runs produced sensible, stable results.
-- The conservative `Math.min` correctly preferred the upload-side hint over the inflated download-side perf timing.
-- Browser privacy clamping on the Network Information API is expected behaviour — Chrome caps `downlink` at ~10 Mbps for 4g regardless of actual link speed. This limits the ceiling of Network API-informed tuning but keeps results conservative and consistent.
-- No tiny upload probe is required at this stage.
 
 ### Async attach operations notes
 
@@ -281,12 +242,16 @@ Send-CmChunkedUpload -BaseUrl "https://server/cm/serviceapi" -FilePath "C:\large
 # Option B: Create a new record and upload to it
 # (Title will default to the filename if omitted)
 Send-CmChunkedUpload -BaseUrl "https://server/cm/serviceapi" -FilePath "C:\largefile.bin" -RecordTypeUri 2 -Title "My Large Document"
+
+# Option C: Stage file then start async attach for an existing record
+Send-CmChunkedUpload -BaseUrl "https://server/cm/serviceapi" -FilePath "C:\largefile.bin" -RecordUri 9000000001 -StageOnly $true -StartAsyncAttach -WaitForAsyncAttach
 ```
 
 Key features:
 - Automatically creates new records or attaches to existing ones.
 - Resumes interrupted uploads by querying the `/missing` endpoint.
 - Performs end-to-end SHA256 checksum verification after assembly.
+- Can call `/Upload/attach/preflight`, `/Upload/attach/start`, and `/Upload/attach/{jobId}` when `-StartAsyncAttach` is used.
 - Handles authentication (Basic Auth or Default Credentials).
 - Uses exponential backoff for retries on individual chunks.
 
@@ -294,7 +259,7 @@ See the script for more details and parameters.
 
 ## C# Client Example
 
-Here is a basic example using `System.Net.Http.HttpClient` to upload a file in chunks from a C# application:
+Here is a basic example using `System.Net.Http.HttpClient` to upload a file in chunks, complete in stage-only mode, and then start async attach:
 
 ```csharp
 using System;
@@ -307,7 +272,7 @@ using System.Threading.Tasks;
 
 public class ChunkedUploadClient
 {
-    public static async Task UploadFileAsync(string baseUrl, string filePath, long recordUri, string username, string password)
+  public static async Task UploadFileAndStartAsyncAttachAsync(string baseUrl, string filePath, long recordUri, string username, string password)
     {
         var fileInfo = new FileInfo(filePath);
         int chunkSize = 4 * 1024 * 1024; // 4MB chunks
@@ -321,6 +286,7 @@ public class ChunkedUploadClient
         // 1. Start the Session
         var startPayload = new
         {
+          StageOnly = true,
             RecordUri = recordUri,
             FileName = fileInfo.Name,
             ContentType = "application/octet-stream",
@@ -331,7 +297,7 @@ public class ChunkedUploadClient
         };
 
         var startContent = new StringContent(JsonSerializer.Serialize(startPayload), Encoding.UTF8, "application/json");
-        var startRes = await client.PostAsync($"{baseUrl}/UploadChunks/start", startContent);
+        var startRes = await client.PostAsync($"{baseUrl}/Upload/start", startContent);
         startRes.EnsureSuccessStatusCode();
         
         using var startStream = await startRes.Content.ReadAsStreamAsync();
@@ -355,7 +321,7 @@ public class ChunkedUploadClient
             long to = offset + bytesRead - 1;
             chunkContent.Headers.Add("Content-Range", $"bytes {offset}-{to}/{fileInfo.Length}");
 
-            var uploadRes = await client.PutAsync($"{baseUrl}/UploadChunks/{sessionId}/chunk/{chunkNumber}", chunkContent);
+            var uploadRes = await client.PutAsync($"{baseUrl}/Upload/{sessionId}/chunk/{chunkNumber}", chunkContent);
             uploadRes.EnsureSuccessStatusCode();
 
             offset += bytesRead;
@@ -364,13 +330,80 @@ public class ChunkedUploadClient
 
         // 3. Complete the Upload
         Console.WriteLine($"[INFO] Completing upload session {sessionId}...");
-        var completeRes = await client.PostAsync($"{baseUrl}/UploadChunks/{sessionId}/complete", new StringContent("{}", Encoding.UTF8, "application/json"));
+        var completeRes = await client.PostAsync($"{baseUrl}/Upload/{sessionId}/complete", new StringContent("{}", Encoding.UTF8, "application/json"));
         completeRes.EnsureSuccessStatusCode();
         
         using var completeStream = await completeRes.Content.ReadAsStreamAsync();
         var completeData = await JsonSerializer.DeserializeAsync<JsonElement>(completeStream);
-        Console.WriteLine($"[SUCCESS] Upload complete! Record URI: {completeData.GetProperty("RecordUri").GetInt64()}");
-        Console.WriteLine($"[SUCCESS] Assembled SHA256: {completeData.GetProperty("AssembledSha256").GetString()}");
+        Console.WriteLine($"[SUCCESS] Upload complete. Assembled SHA256: {completeData.GetProperty("AssembledSha256").GetString()}");
+
+        string stagedFilePath = completeData.GetProperty("StagedFilePath").GetString();
+        string fullUploadedFileName = completeData.GetProperty("FullUploadedFileName").GetString();
+
+        // 4. Preflight async attach source file
+        var preflightPayload = new
+        {
+          SessionId = sessionId,
+          StagedFilePath = stagedFilePath,
+          FullUploadedFileName = fullUploadedFileName
+        };
+        var preflightContent = new StringContent(JsonSerializer.Serialize(preflightPayload), Encoding.UTF8, "application/json");
+        var preflightRes = await client.PostAsync($"{baseUrl}/Upload/attach/preflight", preflightContent);
+        preflightRes.EnsureSuccessStatusCode();
+
+        using var preflightStream = await preflightRes.Content.ReadAsStreamAsync();
+        var preflightData = await JsonSerializer.DeserializeAsync<JsonElement>(preflightStream);
+        if (!preflightData.GetProperty("SourcePathAllowed").GetBoolean() || !preflightData.GetProperty("SourceExists").GetBoolean())
+        {
+          throw new InvalidOperationException("Async attach preflight failed. Source is missing or blocked.");
+        }
+
+        // 5. Start async attach job
+        var attachStartPayload = new
+        {
+          SessionId = sessionId,
+          RecordUri = recordUri,
+          FileName = fileInfo.Name,
+          FullUploadedFileName = fullUploadedFileName,
+          StagedFilePath = stagedFilePath,
+          NewRevision = true,
+          KeepCheckedOut = false,
+          Comments = "Uploaded in chunks"
+        };
+        var attachStartContent = new StringContent(JsonSerializer.Serialize(attachStartPayload), Encoding.UTF8, "application/json");
+        var attachStartRes = await client.PostAsync($"{baseUrl}/Upload/attach/start", attachStartContent);
+        attachStartRes.EnsureSuccessStatusCode();
+
+        using var attachStartStream = await attachStartRes.Content.ReadAsStreamAsync();
+        var attachStartData = await JsonSerializer.DeserializeAsync<JsonElement>(attachStartStream);
+        string jobId = attachStartData.GetProperty("JobId").GetString();
+        Console.WriteLine($"[INFO] Async attach job started: {jobId}");
+
+        // 6. Poll async attach status
+        while (true)
+        {
+          await Task.Delay(TimeSpan.FromSeconds(2));
+
+          var statusRes = await client.GetAsync($"{baseUrl}/Upload/attach/{jobId}");
+          statusRes.EnsureSuccessStatusCode();
+
+          using var statusStream = await statusRes.Content.ReadAsStreamAsync();
+          var statusData = await JsonSerializer.DeserializeAsync<JsonElement>(statusStream);
+          string status = statusData.GetProperty("Status").GetString();
+          Console.WriteLine($"[INFO] Async attach status: {status}");
+
+          if (statusData.GetProperty("Completed").GetBoolean())
+          {
+            if (!statusData.GetProperty("Succeeded").GetBoolean())
+            {
+              string error = statusData.TryGetProperty("ErrorMessage", out var errorProp) ? errorProp.GetString() : "Unknown error";
+              throw new InvalidOperationException($"Async attach failed: {error}");
+            }
+
+            Console.WriteLine("[SUCCESS] Async attach completed.");
+            break;
+          }
+        }
     }
 }
 ```

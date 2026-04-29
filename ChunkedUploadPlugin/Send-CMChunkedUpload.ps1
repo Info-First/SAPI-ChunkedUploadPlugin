@@ -18,6 +18,8 @@ The function supports:
 - File-signature-based session caching for resume across runs
 - One-time automatic fresh-session retry for contiguous complete failures
 - Optional cleanup of staged artifacts in StageOnly mode
+- Optional async attach via /Upload/attach/preflight and /Upload/attach/start
+- Optional async attach status polling via /Upload/attach/{jobId}
 
 .PARAMETER BaseUrl
 ServiceAPI base URL, for example:
@@ -71,6 +73,21 @@ Check In comments forwarded to upload start request.
 .PARAMETER CleanupAfterComplete
 If set and StageOnly is true, calls /Upload/cleanup after successful complete.
 
+.PARAMETER StartAsyncAttach
+When set with -StageOnly and -RecordUri, calls /Upload/attach/preflight and
+/Upload/attach/start after complete.
+
+.PARAMETER WaitForAsyncAttach
+When set with -StartAsyncAttach, polls /Upload/attach/{jobId} until the job
+completes or timeout is reached.
+
+.PARAMETER AsyncAttachPollIntervalSeconds
+Polling interval used with -WaitForAsyncAttach. Default: 2 seconds.
+
+.PARAMETER AsyncAttachTimeoutSeconds
+Maximum wait time for async attach completion when -WaitForAsyncAttach is set.
+Default: 600 seconds.
+
 .PARAMETER MaxContiguousRecoveryAttempts
 Maximum retries using a fresh session when /complete reports contiguous errors.
 Default: 1
@@ -93,6 +110,12 @@ Directly writes uploaded content to an existing record.
 Send-CmChunkedUpload -BaseUrl "http://server/contentmanager/serviceapi" -FilePath "C:\Temp\large.bin" -UseDefaultCredentials -StageOnly $false -RecordTypeUri 9876 -Title "Scripted upload"
 
 Creates a new record (non-stage-only) and attaches uploaded content.
+
+.EXAMPLE
+Send-CmChunkedUpload -BaseUrl "http://server/contentmanager/serviceapi" -FilePath "C:\Temp\large.bin" -UseDefaultCredentials -StageOnly $true -RecordUri 12345 -StartAsyncAttach -WaitForAsyncAttach
+
+Stages content, preflights async attach source availability, starts async attach,
+and waits for completion.
 
 .EXAMPLE
 # OIDC client credentials flow example (token endpoint + bearer auth header).
@@ -141,6 +164,10 @@ function Send-CmChunkedUpload {
         [bool]$KeepCheckedOut = $false,
         [string]$Comments = "Automated chunk upload",
         [switch]$CleanupAfterComplete,
+        [switch]$StartAsyncAttach,
+        [switch]$WaitForAsyncAttach,
+        [int]$AsyncAttachPollIntervalSeconds = 2,
+        [int]$AsyncAttachTimeoutSeconds = 600,
         [int]$MaxContiguousRecoveryAttempts = 1,
         [string]$SessionCacheFilePath = ""
     )
@@ -328,6 +355,91 @@ function Send-CmChunkedUpload {
         }
     }
 
+    function Start-AsyncAttachJob {
+        param(
+            [string]$SessionId,
+            [object]$CompleteResponse
+        )
+
+        if (-not $StageOnly) {
+            throw "-StartAsyncAttach requires -StageOnly `$true so the file is staged before async attach."
+        }
+
+        if ($RecordUri -le 0) {
+            throw "-StartAsyncAttach requires a valid -RecordUri target for attachment."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($CompleteResponse.StagedFilePath) -and [string]::IsNullOrWhiteSpace($CompleteResponse.FullUploadedFileName)) {
+            throw "Complete response did not return StagedFilePath/FullUploadedFileName required for async attach."
+        }
+
+        $preflightBodyObj = @{
+            SessionId = $SessionId
+            StagedFilePath = $CompleteResponse.StagedFilePath
+            FullUploadedFileName = $CompleteResponse.FullUploadedFileName
+        }
+        $preflightBody = $preflightBodyObj | ConvertTo-Json
+
+        Write-Host "[INFO] Running async attach preflight..."
+        $preflightResponse = Invoke-CmApi -Method "Post" -Uri "$BaseUrl/Upload/attach/preflight" -Headers $startHeaders -ContentType "application/json" -Body $preflightBody
+
+        if ($preflightResponse.SourcePathAllowed -ne $true) {
+            throw "Async attach preflight failed: source path is not allowed."
+        }
+        if ($preflightResponse.SourceExists -ne $true) {
+            throw "Async attach preflight failed: staged source file is missing."
+        }
+
+        $attachBodyObj = @{
+            SessionId = $SessionId
+            RecordUri = $RecordUri
+            FileName = $fileInfo.Name
+            FullUploadedFileName = $CompleteResponse.FullUploadedFileName
+            StagedFilePath = $CompleteResponse.StagedFilePath
+            NewRevision = $NewRevision
+            KeepCheckedOut = $KeepCheckedOut
+            Comments = $Comments
+        }
+        $attachBody = $attachBodyObj | ConvertTo-Json
+
+        Write-Host "[INFO] Starting async attach for RecordUri $RecordUri..."
+        $attachResponse = Invoke-CmApi -Method "Post" -Uri "$BaseUrl/Upload/attach/start" -Headers $startHeaders -ContentType "application/json" -Body $attachBody
+
+        if ([string]::IsNullOrWhiteSpace($attachResponse.JobId)) {
+            throw "Async attach start did not return JobId."
+        }
+
+        return [string]$attachResponse.JobId
+    }
+
+    function Wait-AsyncAttachJob {
+        param([string]$JobId)
+
+        $deadlineUtc = [DateTime]::UtcNow.AddSeconds($AsyncAttachTimeoutSeconds)
+        while ([DateTime]::UtcNow -lt $deadlineUtc) {
+            $status = Invoke-CmApi -Method "Get" -Uri "$BaseUrl/Upload/attach/$JobId" -Headers $startHeaders
+            $state = [string]$status.Status
+            Write-Host "[INFO] Async attach job $JobId status: $state"
+
+            if ($status.Completed -eq $true) {
+                if ($status.Succeeded -eq $true) {
+                    Write-Host "[SUCCESS] Async attach completed successfully." -ForegroundColor Green
+                    return $status
+                }
+
+                $errorMessage = [string]$status.ErrorMessage
+                if ([string]::IsNullOrWhiteSpace($errorMessage)) {
+                    $errorMessage = "Unknown async attach error."
+                }
+                throw "Async attach failed: $errorMessage"
+            }
+
+            Start-Sleep -Seconds $AsyncAttachPollIntervalSeconds
+        }
+
+        throw "Timed out waiting for async attach job $JobId after $AsyncAttachTimeoutSeconds seconds."
+    }
+
     function Upload-MissingChunks {
         param(
             [string]$SessionId,
@@ -479,7 +591,17 @@ function Send-CmChunkedUpload {
         throw "Checksum mismatch. Upload may be corrupted."
     }
 
-    if ($CleanupAfterComplete -and $StageOnly) {
+    if ($StartAsyncAttach) {
+        $jobId = Start-AsyncAttachJob -SessionId $sessionId -CompleteResponse $completeResponse
+        Write-Host "[INFO] Async attach job created: $jobId"
+
+        if ($WaitForAsyncAttach) {
+            $asyncAttachStatus = Wait-AsyncAttachJob -JobId $jobId
+            Write-Host "[INFO] Async attach completed at: $($asyncAttachStatus.CompletedUtc)"
+        }
+    }
+
+    if ($CleanupAfterComplete -and $StageOnly -and -not $StartAsyncAttach) {
         Write-Host "[INFO] CleanupAfterComplete enabled. Calling /Upload/cleanup for session $sessionId..."
         $cleanupBodyObj = @{
             SessionId = $sessionId
