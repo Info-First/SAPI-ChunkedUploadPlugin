@@ -127,34 +127,7 @@ function resolveChunkedUploadConcurrency() {
 }
 
 function resolveChunkedUploadLargeFilePilotThresholdMb() {
-    // Explicit override always wins.
-    const configured = window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB;
-    const parsed = parseInt(configured, 10);
-    if (Number.isFinite(parsed) && parsed > 0) {
-        return clampChunkedUploadLargeFilePilotThresholdMb(parsed);
-    }
-
-    // Dynamic threshold can be disabled from host page.
-    if (window.CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_ENABLED === false) {
-        return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
-    }
-
-    const cached = getCachedChunkedUploadDynamicThresholdMb();
-    if (cached !== null) {
-        const hints = resolveChunkedUploadBandwidthHints();
-        const normalizedCached = applyChunkedUploadPerfOnlyThresholdCap(cached, hints.networkHintMbps, hints.performanceHintMbps);
-        if (normalizedCached !== cached) {
-            cacheChunkedUploadDynamicThresholdMb(normalizedCached);
-        }
-        return normalizedCached;
-    }
-
-    const resolvedDynamic = calculateChunkedUploadDynamicThresholdMb();
-    if (resolvedDynamic !== null) {
-        cacheChunkedUploadDynamicThresholdMb(resolvedDynamic);
-        return resolvedDynamic;
-    }
-
+    // Fixed async-attach gate: always use the default threshold.
     return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
 }
 
@@ -172,12 +145,8 @@ window.getChunkedUploadLargeFilePilotThresholdMb = function () {
 };
 
 window.setChunkedUploadLargeFilePilotThresholdMb = function (value) {
-    const parsed = parseInt(value, 10);
-    const normalized = (!Number.isFinite(parsed) || parsed <= 0)
-        ? CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT
-        : clampChunkedUploadLargeFilePilotThresholdMb(parsed);
-    window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB = normalized;
-    return normalized;
+    window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB = null;
+    return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
 };
 
 window.resetChunkedUploadLargeFilePilotThresholdMb = function () {
@@ -244,6 +213,24 @@ function readChunkedUploadNetworkDownlinkMbps() {
     return null;
 }
 
+function readChunkedUploadNetworkUplinkMbps() {
+    const configured = Number(window.CHUNKED_UPLOAD_NETWORK_UPLINK_MBPS || 0);
+    if (Number.isFinite(configured) && configured > 0) {
+        return configured;
+    }
+
+    const connection = navigator && (navigator.connection || navigator.mozConnection || navigator.webkitConnection);
+    if (!connection) return null;
+
+    const rawUplink = Number(connection.uplink || connection.uploadDownlink || 0);
+    if (Number.isFinite(rawUplink) && rawUplink > 0) {
+        return rawUplink;
+    }
+
+    // Browser upload bandwidth hints are often unavailable; downlink is a conservative fallback.
+    return readChunkedUploadNetworkDownlinkMbps();
+}
+
 function readChunkedUploadPerformanceHintMbps() {
     try {
         if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
@@ -275,26 +262,6 @@ function readChunkedUploadPerformanceHintMbps() {
     }
 }
 
-function mapChunkedUploadMbpsToThresholdMb(mbps) {
-    if (!Number.isFinite(mbps) || mbps <= 0) {
-        return CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT;
-    }
-
-    if (mbps < 2) return 256;
-    if (mbps < 5) return 512;
-    if (mbps < 20) return 1024;
-    if (mbps < 60) return 1536;
-    return 2048;
-}
-
-function applyChunkedUploadPerfOnlyThresholdCap(thresholdMb, networkHint, perfHint) {
-    let normalized = clampChunkedUploadLargeFilePilotThresholdMb(thresholdMb);
-    if (!Number.isFinite(networkHint) && Number.isFinite(perfHint)) {
-        normalized = Math.min(normalized, CHUNKED_UPLOAD_PERF_ONLY_THRESHOLD_MB_CAP);
-    }
-    return normalized;
-}
-
 function applyChunkedUploadPerfOnlyConcurrencyCap(concurrency, networkHint, perfHint) {
     let normalized = clampChunkedUploadConcurrency(concurrency);
     if (!Number.isFinite(networkHint) && Number.isFinite(perfHint)) {
@@ -303,96 +270,39 @@ function applyChunkedUploadPerfOnlyConcurrencyCap(concurrency, networkHint, perf
     return normalized;
 }
 
-function calculateChunkedUploadDynamicThresholdMb() {
-    const hints = resolveChunkedUploadBandwidthHints();
-    const networkHint = hints.networkHintMbps;
-    const perfHint = hints.performanceHintMbps;
-    const chosenMbps = hints.chosenMbps;
-
-    if (!Number.isFinite(chosenMbps) || chosenMbps <= 0) {
-        return null;
-    }
-
-    let mappedThreshold = clampChunkedUploadLargeFilePilotThresholdMb(mapChunkedUploadMbpsToThresholdMb(chosenMbps));
-    mappedThreshold = applyChunkedUploadPerfOnlyThresholdCap(mappedThreshold, networkHint, perfHint);
-
-    return mappedThreshold;
-}
-
 function buildChunkedUploadDynamicThresholdDiagnostics() {
-    const configuredRaw = window.CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB;
-    const configuredParsed = parseInt(configuredRaw, 10);
-    const explicitOverrideMb = (Number.isFinite(configuredParsed) && configuredParsed > 0)
-        ? clampChunkedUploadLargeFilePilotThresholdMb(configuredParsed)
-        : null;
+    const explicitOverrideMb = null;
 
     const connection = navigator && (navigator.connection || navigator.mozConnection || navigator.webkitConnection);
     const connectionDownlinkMbps = connection ? Number(connection.downlink || 0) : null;
+    const connectionUplinkMbps = connection ? Number(connection.uplink || connection.uploadDownlink || 0) : null;
     const connectionEffectiveType = connection ? String(connection.effectiveType || '') : '';
 
-    const hints = resolveChunkedUploadBandwidthHints();
-    const networkHintMbps = hints.networkHintMbps;
-    const performanceHintMbps = hints.performanceHintMbps;
-    const chosenMbps = hints.chosenMbps;
-
-    const mappedThresholdMb = (Number.isFinite(chosenMbps) && chosenMbps > 0)
-        ? (function () {
-            let mapped = clampChunkedUploadLargeFilePilotThresholdMb(mapChunkedUploadMbpsToThresholdMb(chosenMbps));
-            mapped = applyChunkedUploadPerfOnlyThresholdCap(mapped, networkHintMbps, performanceHintMbps);
-            return mapped;
-        }())
-        : null;
-
-    let cacheRawMb = null;
-    let cacheUpdatedUtcMs = null;
-    let cacheAgeMs = null;
-    let cacheValid = false;
-    let cacheNormalizedMb = null;
-    try {
-        cacheRawMb = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_SESSION_KEY);
-        cacheUpdatedUtcMs = sessionStorage.getItem(CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_UPDATED_AT_SESSION_KEY);
-
-        if (cacheRawMb && cacheUpdatedUtcMs) {
-            const updatedMs = Number(cacheUpdatedUtcMs);
-            const ageMs = Date.now() - updatedMs;
-            if (Number.isFinite(ageMs) && ageMs >= 0) {
-                cacheAgeMs = ageMs;
-                cacheValid = ageMs <= CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_TTL_MS;
-            }
-
-            const parsed = Number(cacheRawMb);
-            if (Number.isFinite(parsed) && parsed > 0) {
-                cacheNormalizedMb = clampChunkedUploadLargeFilePilotThresholdMb(parsed);
-            }
-        }
-    } catch (e) {
-        // Ignore sessionStorage read issues.
-    }
-
     return {
-        dynamicEnabled: window.CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_ENABLED !== false,
+        dynamicEnabled: false,
         explicitOverrideMb: explicitOverrideMb,
         cache: {
-            rawMb: cacheRawMb,
-            normalizedMb: cacheNormalizedMb,
-            updatedUtcMs: cacheUpdatedUtcMs,
-            ageMs: cacheAgeMs,
+            rawMb: null,
+            normalizedMb: null,
+            updatedUtcMs: null,
+            ageMs: null,
             ttlMs: CHUNKED_UPLOAD_DYNAMIC_THRESHOLD_TTL_MS,
-            valid: cacheValid
+            valid: false
         },
         inputs: {
             connectionDownlinkMbps: Number.isFinite(connectionDownlinkMbps) && connectionDownlinkMbps > 0 ? connectionDownlinkMbps : null,
+            connectionUplinkMbps: Number.isFinite(connectionUplinkMbps) && connectionUplinkMbps > 0 ? connectionUplinkMbps : null,
             connectionEffectiveType: connectionEffectiveType || null,
-            networkHintMbps: Number.isFinite(networkHintMbps) && networkHintMbps > 0 ? networkHintMbps : null,
-            performanceHintMbps: Number.isFinite(performanceHintMbps) && performanceHintMbps > 0 ? performanceHintMbps : null,
-            chosenMbps: Number.isFinite(chosenMbps) && chosenMbps > 0 ? chosenMbps : null
+            networkHintMbps: null,
+            performanceHintMbps: null,
+            chosenMbps: null
         },
         mapping: {
             minMb: CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_MIN,
             maxMb: CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_MAX,
             perfOnlyCapMb: CHUNKED_UPLOAD_PERF_ONLY_THRESHOLD_MB_CAP,
             defaultMb: CHUNKED_UPLOAD_LARGE_FILE_PILOT_THRESHOLD_MB_DEFAULT,
-            mappedThresholdMb: mappedThresholdMb
+            mappedThresholdMb: null
         },
         resolvedThresholdMb: resolveChunkedUploadLargeFilePilotThresholdMb()
     };
@@ -3830,7 +3740,7 @@ if (window.__chunkedUploadFormFieldChangeHandlerInstalled !== true) {
 }
 
 function resolveChunkedUploadBandwidthHints() {
-    const networkHintMbps = readChunkedUploadNetworkDownlinkMbps();
+    const networkHintMbps = readChunkedUploadNetworkUplinkMbps();
     const performanceHintMbps = readChunkedUploadPerformanceHintMbps();
 
     let chosenMbps = null;
