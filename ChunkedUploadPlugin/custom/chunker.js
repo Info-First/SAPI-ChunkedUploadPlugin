@@ -1,11 +1,9 @@
 const CHUNKED_UPLOAD_VERBOSE_STORAGE_KEY = 'cm_chunked_upload_verbose';
 const CHUNKED_UPLOAD_DEBUG_BANNER_ID = 'cm-chunked-upload-debug-banner';
-const CHUNKED_UPLOAD_ASYNC_BADGE_ID = 'cm-chunked-upload-async-attach-badge';
-const CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID = 'cm-chunked-upload-async-attach-badge-text';
-const CHUNKED_UPLOAD_ASYNC_BADGE_RETRY_ID = 'cm-chunked-upload-async-attach-badge-retry';
-const CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY = 'cm_chunked_upload_async_attach_badge';
-const CHUNKED_UPLOAD_ASYNC_BADGE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
-const CHUNKED_UPLOAD_ASYNC_BADGE_AUTO_DISMISS_MS = 5000;
+// Badge constants removed — async attach state is now surfaced via the native "Record created" message area.
+const CHUNKED_UPLOAD_POST_ATTACH_QUERY_SESSION_KEY = 'cm_chunked_upload_post_attach_query';
+const CHUNKED_UPLOAD_POST_ATTACH_QUERY_SET_AT_SESSION_KEY = 'cm_chunked_upload_post_attach_query_set_utc';
+const CHUNKED_UPLOAD_POST_ATTACH_QUERY_TTL_MS = 2 * 60 * 1000;
 const SERVICE_API_BASE_URL = '/contentmanager/serviceapi';
 const JSON_ACCEPT_HEADERS = { 'Accept': 'application/json' };
 const CHUNKED_UPLOAD_ROUTE_ROOT = (window.CHUNKED_UPLOAD_ROUTE_ROOT || 'Upload').replace(/^\/+|\/+$/g, '');
@@ -27,14 +25,15 @@ const CHUNKED_UPLOAD_RESUME_SWEEP_MARKER_KEY = 'cm_upload_staged_last_sweep_utc'
 const CHUNKED_UPLOAD_RESUME_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const CHUNKED_UPLOAD_RESUME_SWEEP_MAX_KEYS = 25;
 const CHUNKED_UPLOAD_SESSION_ID_REGEX = /^[a-z0-9]{32}$/i;
+const CHUNKED_UPLOAD_CREATED_IN_PROGRESS_SUFFIX = ', background upload in progress...';
 
 let CHUNKED_UPLOAD_VERBOSE = false;
 let _chunkedUploadLargeFileTimeoutRecoveryShown = false;
-let _chunkedUploadAsyncBadgeAutoDismissTimer = null;
-let _chunkedUploadAsyncBadgeTransientSuppressed = false;
-let _chunkedUploadAsyncBadgeRunningDots = 0;
 let _chunkedUploadAsyncAttachRetryContext = null;
+let _chunkedUploadCreatedMessageObserver = null;
+let _chunkedUploadCreatedMessageBaseText = '';
 let _chunkedUploadAsyncAttachRetryInProgress = false;
+let _chunkedUploadAsyncAttachAutoRefreshScheduled = false;
 
 let _chunkedUploadResumeSweepPromise = null;
 const _chunkedUploadRecentNativeIntercepts = {};
@@ -45,6 +44,7 @@ let _chunkedUploadPendingTitleContextElement = null;
 let _chunkedUploadPendingTitleSetAtUtc = 0;
 let _chunkedUploadPendingTitleApplyTimer = null;
 let _chunkedUploadPendingTitleObserver = null;
+let _chunkedUploadCommandPanelObserver = null;
 
 function clampChunkedUploadConcurrency(value) {
     const parsed = parseInt(value, 10);
@@ -570,7 +570,6 @@ function updateChunkedUploadDebugBanner() {
     if (!CHUNKED_UPLOAD_VERBOSE) {
         banner.style.display = 'none';
         applyChunkedUploadPageBottomInset(0);
-        syncAsyncAttachBadgeBottomOffset();
         return;
     }
 
@@ -579,7 +578,6 @@ function updateChunkedUploadDebugBanner() {
     }
     banner.style.display = 'flex';
     applyChunkedUploadPageBottomInset(resolveChunkedUploadDebugBannerInsetPx());
-    syncAsyncAttachBadgeBottomOffset();
 }
 
 window.setChunkedUploadVerbose = function (value) {
@@ -609,55 +607,129 @@ function installChunkedUploadDebugBanner() {
     updateChunkedUploadDebugBanner();
 }
 
-function resolveAsyncAttachBadgeBottomOffsetPx() {
-    const debugBanner = document.getElementById(CHUNKED_UPLOAD_DEBUG_BANNER_ID);
-    if (debugBanner && debugBanner.style.display !== 'none' && debugBanner.offsetHeight > 0) {
-        return debugBanner.offsetHeight + 8;
-    }
-
-    return 12;
+function getChunkedUploadCreatedMessageElement() {
+    // Targets the h4.clsErrorTitle inside the "Record created" success panel.
+    return document.querySelector('.clsNoItem .clsErrorTitle');
 }
 
-function syncAsyncAttachBadgeBottomOffset() {
-    const badge = document.getElementById(CHUNKED_UPLOAD_ASYNC_BADGE_ID);
-    if (!badge) return;
-    badge.style.bottom = `${resolveAsyncAttachBadgeBottomOffsetPx()}px`;
-}
+function updateChunkedUploadCreatedMessageForAsyncAttach(state) {
+    const normalized = String(state || '').toLowerCase();
+    const nativeText = (typeof HP !== 'undefined' && HP && HP.HPTRIM && HP.HPTRIM.Messages && HP.HPTRIM.Messages.web_single_record_created)
+        ? HP.HPTRIM.Messages.web_single_record_created
+        : 'Record created';
 
-function persistAsyncAttachBadgeState(state, message) {
-    try {
-        sessionStorage.setItem(CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY, JSON.stringify({
-            state: String(state || ''),
-            message: String(message || ''),
-            updatedUtc: Date.now()
-        }));
-    } catch (e) {
-        // Ignore session storage write issues.
-    }
-}
+    if (normalized === 'queued' || normalized === 'running') {
+        const currentElement = getChunkedUploadCreatedMessageElement();
+        const currentText = currentElement ? String(currentElement.textContent || '').trim() : '';
 
-function clearPersistedAsyncAttachBadgeState() {
-    try {
-        sessionStorage.removeItem(CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY);
-    } catch (e) {
-        // Ignore session storage delete issues.
-    }
-}
-
-function readPersistedAsyncAttachBadgeState() {
-    try {
-        const raw = sessionStorage.getItem(CHUNKED_UPLOAD_ASYNC_BADGE_STORAGE_KEY);
-        if (!raw) return null;
-        const parsed = JSON.parse(raw);
-        if (!parsed || !parsed.state) return null;
-        const age = Date.now() - Number(parsed.updatedUtc || 0);
-        if (!Number.isFinite(age) || age < 0 || age > CHUNKED_UPLOAD_ASYNC_BADGE_MAX_AGE_MS) {
-            clearPersistedAsyncAttachBadgeState();
-            return null;
+        if (currentText && currentText.toLowerCase().indexOf('background upload in progress') < 0) {
+            _chunkedUploadCreatedMessageBaseText = currentText;
         }
-        return parsed;
-    } catch (e) {
-        return null;
+
+        if (!_chunkedUploadCreatedMessageBaseText) {
+            _chunkedUploadCreatedMessageBaseText = nativeText;
+        }
+
+        const progressText = `${_chunkedUploadCreatedMessageBaseText}${CHUNKED_UPLOAD_CREATED_IN_PROGRESS_SUFFIX}`;
+
+        // Disconnect any previous observer before starting a new one.
+        if (_chunkedUploadCreatedMessageObserver) {
+            try { _chunkedUploadCreatedMessageObserver.disconnect(); } catch (e) { /* ignore */ }
+            _chunkedUploadCreatedMessageObserver = null;
+        }
+
+        if (!setChunkedUploadCreatedMessageText(progressText) && typeof MutationObserver !== 'undefined' && document.body) {
+            // Panel not rendered yet — watch for it.
+            _chunkedUploadCreatedMessageObserver = new MutationObserver(function () {
+                if (setChunkedUploadCreatedMessageText(progressText)) {
+                    if (_chunkedUploadCreatedMessageObserver) {
+                        try { _chunkedUploadCreatedMessageObserver.disconnect(); } catch (e) { /* ignore */ }
+                        _chunkedUploadCreatedMessageObserver = null;
+                    }
+                }
+            });
+            _chunkedUploadCreatedMessageObserver.observe(document.body, { childList: true, subtree: true });
+        }
+    } else {
+        // Completed (succeeded or failed) — stop watching and restore the native text.
+        if (_chunkedUploadCreatedMessageObserver) {
+            try { _chunkedUploadCreatedMessageObserver.disconnect(); } catch (e) { /* ignore */ }
+            _chunkedUploadCreatedMessageObserver = null;
+        }
+        const restoreText = _chunkedUploadCreatedMessageBaseText || nativeText;
+        setChunkedUploadCreatedMessageText(restoreText);
+        _chunkedUploadCreatedMessageBaseText = '';
+    }
+}
+
+function setChunkedUploadCreatedMessageText(text) {
+    const el = getChunkedUploadCreatedMessageElement();
+    if (!el) return false;
+    el.textContent = text;
+    return true;
+}
+
+let _chunkedUploadFinishedButtonSuppressed = false;
+let _chunkedUploadFinishedButtonObserver = null;
+
+function getChunkedUploadFinishedButtons() {
+    return document.querySelectorAll(
+        'button[name="saveBtn"][type="submit"][data-bind*="finished"], button[data-bind*="$parent.finished"], button[data-bind*="finished"]'
+    );
+}
+
+function applyChunkedUploadFinishedButtonSuppression(suppress) {
+    const shouldSuppress = suppress === true;
+    _chunkedUploadFinishedButtonSuppressed = shouldSuppress;
+
+    const buttons = getChunkedUploadFinishedButtons();
+    for (let i = 0; i < buttons.length; i++) {
+        const button = buttons[i];
+        if (!button) continue;
+
+        if (shouldSuppress) {
+            if (!button.hasAttribute('data-cup-orig-display')) {
+                button.setAttribute('data-cup-orig-display', button.style.display || '');
+            }
+            button.style.display = 'none';
+            button.disabled = true;
+            button.setAttribute('aria-disabled', 'true');
+        } else {
+            const originalDisplay = button.getAttribute('data-cup-orig-display');
+            if (originalDisplay !== null) {
+                button.style.display = originalDisplay;
+                button.removeAttribute('data-cup-orig-display');
+            }
+            button.disabled = false;
+            button.removeAttribute('aria-disabled');
+        }
+    }
+
+    if (shouldSuppress) {
+        if (!_chunkedUploadFinishedButtonObserver && typeof MutationObserver !== 'undefined' && document.body) {
+            _chunkedUploadFinishedButtonObserver = new MutationObserver(function () {
+                if (_chunkedUploadFinishedButtonSuppressed !== true) return;
+                const currentButtons = getChunkedUploadFinishedButtons();
+                for (let i = 0; i < currentButtons.length; i++) {
+                    const currentButton = currentButtons[i];
+                    if (!currentButton) continue;
+                    if (!currentButton.hasAttribute('data-cup-orig-display')) {
+                        currentButton.setAttribute('data-cup-orig-display', currentButton.style.display || '');
+                    }
+                    currentButton.style.display = 'none';
+                    currentButton.disabled = true;
+                    currentButton.setAttribute('aria-disabled', 'true');
+                }
+            });
+            _chunkedUploadFinishedButtonObserver.observe(document.body, { childList: true, subtree: true });
+        }
+    } else if (_chunkedUploadFinishedButtonObserver) {
+        try {
+            _chunkedUploadFinishedButtonObserver.disconnect();
+        } catch (e) {
+            // Ignore observer cleanup issues.
+        }
+        _chunkedUploadFinishedButtonObserver = null;
     }
 }
 
@@ -737,91 +809,6 @@ function isChunkedUploadAsyncAttachRetryableError(error) {
     if (combined.indexOf('source file was not found') >= 0) return false;
 
     return true;
-}
-
-function getOrCreateAsyncAttachBadge() {
-    if (!document.body) return null;
-
-    let badge = document.getElementById(CHUNKED_UPLOAD_ASYNC_BADGE_ID);
-    if (badge) return badge;
-
-    badge = document.createElement('div');
-    badge.id = CHUNKED_UPLOAD_ASYNC_BADGE_ID;
-    badge.style.cssText = [
-        'display:none',
-        'position:fixed',
-        'left:16px',
-        'right:auto',
-        'width:min(460px, calc(100vw - 32px))',
-        'z-index:100001',
-        'border-radius:12px',
-        'padding:10px 14px',
-        'font-size:13px',
-        'font-weight:600',
-        'line-height:1.35',
-        'box-shadow:0 2px 10px rgba(0,0,0,0.08)',
-        'display:flex',
-        'align-items:center',
-        'justify-content:space-between',
-        'gap:12px'
-    ].join(';');
-
-    const text = document.createElement('div');
-    text.id = CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID;
-    text.style.cssText = 'min-width:0;word-break:break-word;';
-    badge.appendChild(text);
-
-    const actions = document.createElement('div');
-    actions.style.cssText = 'display:flex;align-items:center;gap:8px;';
-
-    const retryButton = document.createElement('button');
-    retryButton.type = 'button';
-    retryButton.id = CHUNKED_UPLOAD_ASYNC_BADGE_RETRY_ID;
-    retryButton.className = 'btn btn-flat btn-secondary';
-    retryButton.textContent = 'Retry';
-    retryButton.style.cssText = 'display:none;white-space:nowrap;padding:4px 10px;';
-    retryButton.onclick = function () {
-        void retryChunkedUploadAsyncAttachFromBadge();
-    };
-    actions.appendChild(retryButton);
-
-    const dismissButton = document.createElement('button');
-    dismissButton.type = 'button';
-    dismissButton.className = 'btn btn-flat btn-secondary';
-    dismissButton.textContent = 'Dismiss';
-    dismissButton.style.cssText = 'white-space:nowrap;padding:4px 10px;';
-    dismissButton.onclick = function () {
-        const currentState = String(badge.dataset.state || '').toLowerCase();
-        if (currentState === 'queued' || currentState === 'running') {
-            _chunkedUploadAsyncBadgeTransientSuppressed = true;
-        }
-        updateAsyncAttachBadge(null, 'hidden');
-    };
-    actions.appendChild(dismissButton);
-
-    badge.appendChild(actions);
-
-    document.body.appendChild(badge);
-    syncAsyncAttachBadgeBottomOffset();
-    return badge;
-}
-
-function restoreAsyncAttachBadgeFromSession() {
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', restoreAsyncAttachBadgeFromSession, { once: true });
-        return;
-    }
-
-    const persisted = readPersistedAsyncAttachBadgeState();
-    if (!persisted) return;
-
-    const restoredState = String(persisted.state || '').toLowerCase();
-    if (restoredState === 'queued' || restoredState === 'running') {
-        clearPersistedAsyncAttachBadgeState();
-        return;
-    }
-
-    updateAsyncAttachBadge(null, persisted.state, persisted.message);
 }
 
 function logDebug() {
@@ -990,9 +977,7 @@ function getChunkedUploadProgressMessage(percent, isResuming) {
 
 logDebug("🚀 CHUNKED UPLOAD SCRIPT IS LOADED AND RUNNING!");
 installChunkedUploadDebugBanner();
-restoreAsyncAttachBadgeFromSession();
 installChunkedUploadDynamicThresholdRefresh();
-window.addEventListener('resize', syncAsyncAttachBadgeBottomOffset);
 window.addEventListener('resize', updateChunkedUploadDebugBanner);
 void ensureChunkedUploadResumeSweep();
 
@@ -1297,8 +1282,62 @@ async function pollChunkedUploadAsyncAttach(jobId, timeoutMs, onStatus) {
     throw new Error('Timed out waiting for async attach completion.');
 }
 
-async function runChunkedUploadAsyncAttach(pending, recordUri) {
+function scheduleChunkedUploadPostAttachRefresh(recordUri, options) {
+    const effective = options || {};
+    if (effective.isRecordCreateFlow !== true) return;
+
+    const numericUri = Number(recordUri || 0);
+    if (!Number.isFinite(numericUri) || numericUri <= 0) return;
+    if (_chunkedUploadAsyncAttachAutoRefreshScheduled) return;
+
+    _chunkedUploadAsyncAttachAutoRefreshScheduled = true;
+
+    setTimeout(function () {
+        updateChunkedUploadCreatedMessageForAsyncAttach('succeeded');
+        applyChunkedUploadFinishedButtonSuppression(false);
+    }, 300);
+}
+
+function setChunkedUploadPendingPostAttachUri(recordUri) {
+    const numericUri = Number(recordUri || 0);
+    if (!Number.isFinite(numericUri) || numericUri <= 0) return;
+
+    try {
+        sessionStorage.setItem(CHUNKED_UPLOAD_POST_ATTACH_QUERY_SESSION_KEY, String(numericUri));
+        sessionStorage.setItem(CHUNKED_UPLOAD_POST_ATTACH_QUERY_SET_AT_SESSION_KEY, String(Date.now()));
+    } catch (e) {
+        // Ignore storage write issues.
+    }
+}
+
+function consumeChunkedUploadPendingPostAttachUri() {
+    try {
+        const stored = sessionStorage.getItem(CHUNKED_UPLOAD_POST_ATTACH_QUERY_SESSION_KEY);
+        const setAtRaw = sessionStorage.getItem(CHUNKED_UPLOAD_POST_ATTACH_QUERY_SET_AT_SESSION_KEY);
+
+        sessionStorage.removeItem(CHUNKED_UPLOAD_POST_ATTACH_QUERY_SESSION_KEY);
+        sessionStorage.removeItem(CHUNKED_UPLOAD_POST_ATTACH_QUERY_SET_AT_SESSION_KEY);
+
+        const numericUri = Number(stored || 0);
+        if (!Number.isFinite(numericUri) || numericUri <= 0) return 0;
+
+        const ageMs = Date.now() - Number(setAtRaw || 0);
+        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > CHUNKED_UPLOAD_POST_ATTACH_QUERY_TTL_MS) {
+            return 0;
+        }
+
+        return numericUri;
+    } catch (e) {
+        return 0;
+    }
+}
+
+async function runChunkedUploadAsyncAttach(pending, recordUri, options) {
+    const effectiveOptions = options || {};
     updateAsyncAttachBadgeForPending(pending, 'running');
+    if (effectiveOptions.isRecordCreateFlow === true) {
+        updateChunkedUploadCreatedMessageForAsyncAttach('running');
+    }
 
     try {
         const start = await startChunkedUploadAsyncAttach(pending, recordUri);
@@ -1312,14 +1351,22 @@ async function runChunkedUploadAsyncAttach(pending, recordUri) {
             const state = String(nextStatus.Status || '').toLowerCase();
             if (state === 'queued') {
                 updateAsyncAttachBadgeForPending(pending, 'queued');
+                if (effectiveOptions.isRecordCreateFlow === true) {
+                    updateChunkedUploadCreatedMessageForAsyncAttach('queued');
+                }
             } else if (state === 'running') {
                 updateAsyncAttachBadgeForPending(pending, 'running');
+                if (effectiveOptions.isRecordCreateFlow === true) {
+                    updateChunkedUploadCreatedMessageForAsyncAttach('running');
+                }
             }
         });
 
         if (status && status.Succeeded === true) {
             clearChunkedUploadAsyncAttachRetryContext();
-            updateAsyncAttachBadgeForPending(pending, 'succeeded');
+            if (effectiveOptions.isRecordCreateFlow !== true) {
+                updateAsyncAttachBadgeForPending(pending, 'succeeded');
+            }
 
             if (pending.expectedHash) {
                 await verifyDocumentHash(recordUri, pending.expectedHash);
@@ -1327,6 +1374,7 @@ async function runChunkedUploadAsyncAttach(pending, recordUri) {
 
             await cleanupChunkedUpload(pending);
             console.log(`[ChunkedUpload] Async attach completed for record ${recordUri}.`);
+            scheduleChunkedUploadPostAttachRefresh(recordUri, effectiveOptions);
             return;
         }
 
@@ -1346,6 +1394,10 @@ async function runChunkedUploadAsyncAttach(pending, recordUri) {
         }
 
         updateAsyncAttachBadgeForPending(pending, 'failed', `Async attach failed: ${message}`);
+        if (effectiveOptions.isRecordCreateFlow === true) {
+            updateChunkedUploadCreatedMessageForAsyncAttach('failed');
+            applyChunkedUploadFinishedButtonSuppression(false);
+        }
         throw error;
     }
 }
@@ -1518,13 +1570,17 @@ function resolvePendingChunkedUploadForSaveBody(outboundBody) {
             const isRecordSaveCall =
                 _method === 'POST' &&
                 (/\/ServiceApi\/Record\b/i.test(_url) || /\/ServiceApi\/RecordCheckIn\b/i.test(_url) || /\/ServiceApi\/Record\/\d+\/CheckIn\b/i.test(_url));
+            const isRecordCreateStyleCheckInCall =
+                _method === 'POST' &&
+                /\/ServiceApi\/RecordCheckIn\b/i.test(_url);
             const isRecordCheckInCall =
                 _method === 'POST' &&
                 (/\/ServiceApi\/RecordCheckIn\b/i.test(_url) || /\/ServiceApi\/Record\/\d+\/CheckIn\b/i.test(_url));
             const isRecordCreateCall =
-                _method === 'POST' &&
-                /\/ServiceApi\/Record\b/i.test(_url) &&
-                !isRecordCheckInCall;
+                ((_method === 'POST' &&
+                    /\/ServiceApi\/Record\b/i.test(_url) &&
+                    !isRecordCheckInCall)
+                    || isRecordCreateStyleCheckInCall);
 
             if (isRecordSaveCall) {
                 ensureChunkedUploadTitleBeforeSubmit(_chunkedUploadPendingTitleContextElement || _chunkedUploadLastContextElement || document.body);
@@ -1545,7 +1601,7 @@ function resolvePendingChunkedUploadForSaveBody(outboundBody) {
 
                             unregisterPendingUpload(preSaveMatch.matchedKey, preSaveMatch.pending);
                             updateAsyncAttachBadgeForPending(preSaveMatch.pending, 'failed', gate.reason);
-                            alert(`Cannot create record with metadata only. ${gate.reason}`);
+                            alert(`${gate.reason}`);
                             return;
                         }
 
@@ -1613,7 +1669,9 @@ function resolvePendingChunkedUploadForSaveBody(outboundBody) {
 
                                 if (pending.isLargeFilePilotCandidate === true) {
                                     try {
-                                        await runChunkedUploadAsyncAttach(pending, uri);
+                                        await runChunkedUploadAsyncAttach(pending, uri, {
+                                            isRecordCreateFlow: isRecordCreateCall === true
+                                        });
                                     } catch (attachError) {
                                         console.error('[ChunkedUpload] Async attach failed:', attachError);
 
@@ -1741,7 +1799,9 @@ function resolvePendingChunkedUploadForSaveBody(outboundBody) {
 
                         if (pending.isLargeFilePilotCandidate === true) {
                             try {
-                                await runChunkedUploadAsyncAttach(pending, uri);
+                                await runChunkedUploadAsyncAttach(pending, uri, {
+                                    isRecordCreateFlow: isRecordCreateCall === true
+                                });
                             } catch (attachError) {
                                 console.error('[ChunkedUpload] Async attach failed:', attachError);
                                 alert(`Large-file async attach failed: ${attachError.message || attachError}`);
@@ -1823,19 +1883,12 @@ function getCsrfToken() {
         }
     }
 
-    // 2. Fallback to older Web Client objects just in case
-    if (window.HP && window.HP.HPTRIM) {
-        if (window.HP.HPTRIM.trimOptions && window.HP.HPTRIM.trimOptions.antiForgeryToken) {
-            return window.HP.HPTRIM.trimOptions.antiForgeryToken;
-        }
-    }
-
-    // 3. Check the global __RequestVerificationToken object
+    // 2. Check the global __RequestVerificationToken object
     if (window.__RequestVerificationToken) {
         return window.__RequestVerificationToken;
     }
 
-    // 4. Fallback to DOM elements
+    // 3. Fallback to DOM elements
     const inputElement = document.querySelector('input[name="__RequestVerificationToken"]');
     if (inputElement) {
         return inputElement.value;
@@ -1844,68 +1897,30 @@ function getCsrfToken() {
     return null;
 }
 
-function createChunkedUploadCancelledError() {
-    const error = new Error(getChunkedUploadOverlayText().uploadCancelled);
-    error.isChunkedUploadCancelled = true;
-    return error;
-}
-
-function isChunkedUploadCancelled(error) {
-    return !!(error && (error.isChunkedUploadCancelled === true || error.name === 'AbortError'));
-}
-
-function resolveValueCandidate(source, keys) {
-    if (!source) return undefined;
-
-    for (let i = 0; i < keys.length; i++) {
-        const key = keys[i];
-        if (!(key in source)) continue;
-        const raw = source[key];
-        try {
-            return (typeof raw === 'function') ? raw.call(source) : raw;
-        } catch (e) {
-            return raw;
-        }
-    }
-
-    return undefined;
-}
-
-function coerceBoolean(value, fallback) {
-    if (typeof value === 'boolean') return value;
-    if (typeof value === 'string') {
-        const normalized = value.trim().toLowerCase();
-        if (normalized === 'true') return true;
-        if (normalized === 'false') return false;
-    }
-    return fallback;
-}
-
-function coerceString(value, fallback) {
-    if (value === undefined || value === null) return fallback;
-    return String(value);
-}
-
 function readCheckInOptionsFromModel(model) {
     if (!model || typeof model !== 'object') return null;
 
-    const newRevision = resolveValueCandidate(model, ['makeNewRevision', 'newRevision', 'NewRevision']);
-    const keepCheckedOut = resolveValueCandidate(model, ['keepCheckedOut', 'keepBookedOut', 'KeepCheckedOut']);
-    const comments = resolveValueCandidate(model, ['comments', 'Comments']);
+    const newRevisionValue =
+        typeof model.newRevision === 'function' ? model.newRevision() : model.newRevision;
+    const keepCheckedOutValue =
+        typeof model.keepCheckedOut === 'function' ? model.keepCheckedOut() : model.keepCheckedOut;
+    const commentsValue =
+        typeof model.comments === 'function' ? model.comments() : model.comments;
 
-    if (newRevision === undefined && keepCheckedOut === undefined && comments === undefined) {
+    if (typeof newRevisionValue === 'undefined'
+        && typeof keepCheckedOutValue === 'undefined'
+        && typeof commentsValue === 'undefined') {
         return null;
     }
 
     return {
-        newRevision: coerceBoolean(newRevision, true),
-        keepCheckedOut: coerceBoolean(keepCheckedOut, false),
-        comments: coerceString(comments, '')
+        newRevision: coerceChunkedUploadBoolean(newRevisionValue, true),
+        keepCheckedOut: coerceChunkedUploadBoolean(keepCheckedOutValue, false),
+        comments: commentsValue == null ? '' : String(commentsValue)
     };
 }
 
 function resolveCheckInOptionsFromContext(sourceElement) {
-    // Defaults match current behavior when no Check In context is detected.
     const defaults = {
         newRevision: true,
         keepCheckedOut: false,
@@ -1926,7 +1941,6 @@ function resolveCheckInOptionsFromContext(sourceElement) {
         }
     }
 
-    // Fallback to app-level Check In form when KO context chain does not expose options.
     const rootCheckInForm = window.root && window.root.checkInForm;
     const rootOptions = readCheckInOptionsFromModel(rootCheckInForm);
     if (rootOptions) {
@@ -1934,6 +1948,28 @@ function resolveCheckInOptionsFromContext(sourceElement) {
     }
 
     return defaults;
+}
+
+function createChunkedUploadCancelledError() {
+    const error = new Error('Chunked upload cancelled by user.');
+    error.name = 'AbortError';
+    error.isChunkedUploadCancelled = true;
+    return error;
+}
+
+function isChunkedUploadCancelled(error) {
+    if (!error) return false;
+    if (error.isChunkedUploadCancelled === true) return true;
+
+    const name = String(error.name || '').toLowerCase();
+    if (name === 'aborterror') return true;
+
+    const message = String(error.message || '').toLowerCase();
+    if (message.indexOf('cancelled') >= 0 || message.indexOf('canceled') >= 0 || message.indexOf('aborted') >= 0) {
+        return true;
+    }
+
+    return false;
 }
 
 function cancelChunkedUploadState(state) {
@@ -2496,99 +2532,15 @@ function resolveAnyUploadKoViewModel() {
 }
 
 function updateAsyncAttachBadge(koViewModelId, state, detailText) {
-    const badge = getOrCreateAsyncAttachBadge();
-    if (!badge) return;
-
-    const messageElement = badge.querySelector(`#${CHUNKED_UPLOAD_ASYNC_BADGE_TEXT_ID}`) || badge;
-    const retryButton = badge.querySelector(`#${CHUNKED_UPLOAD_ASYNC_BADGE_RETRY_ID}`);
-
-    if (_chunkedUploadAsyncBadgeAutoDismissTimer) {
-        clearTimeout(_chunkedUploadAsyncBadgeAutoDismissTimer);
-        _chunkedUploadAsyncBadgeAutoDismissTimer = null;
-    }
-
-    if (!state || state === 'hidden') {
-        badge.style.display = 'none';
-        badge.dataset.state = '';
-        messageElement.textContent = '';
-        if (retryButton) {
-            retryButton.style.display = 'none';
-            retryButton.disabled = false;
-        }
-        clearPersistedAsyncAttachBadgeState();
-        clearChunkedUploadAsyncAttachRetryContext();
-        return;
-    }
-
     const normalized = String(state || '').toLowerCase();
-    let text = detailText || '';
+    const isInProgress = normalized === 'queued' || normalized === 'running';
+    const isTerminal = normalized === 'succeeded' || normalized === 'failed' || !state || normalized === 'hidden';
 
-    if (!text) {
-        if (normalized === 'queued') text = 'Background file upload queued';
-        else if (normalized === 'running') {
-            _chunkedUploadAsyncBadgeRunningDots = (_chunkedUploadAsyncBadgeRunningDots % 3) + 1;
-            text = `Background file upload in progress${'.'.repeat(_chunkedUploadAsyncBadgeRunningDots)}`;
-        }
-        else if (normalized === 'succeeded') text = 'Background file upload complete';
-        else if (normalized === 'failed') text = 'Async attach failed';
-        else text = 'Async attach status';
-    }
+    applyChunkedUploadFinishedButtonSuppression(isInProgress);
+    updateChunkedUploadCreatedMessageForAsyncAttach(normalized);
 
-    if (normalized !== 'running') {
-        _chunkedUploadAsyncBadgeRunningDots = 0;
-    }
-
-    if (normalized === 'succeeded') {
+    if (isTerminal) {
         clearChunkedUploadAsyncAttachRetryContext();
-    }
-
-    if ((normalized === 'queued' || normalized === 'running') && _chunkedUploadAsyncBadgeTransientSuppressed) {
-        return;
-    }
-
-    if (normalized === 'succeeded' || normalized === 'failed') {
-        _chunkedUploadAsyncBadgeTransientSuppressed = false;
-    }
-
-    badge.style.display = 'flex';
-    badge.dataset.state = normalized;
-    messageElement.textContent = text;
-
-    if (retryButton) {
-        const showRetry = normalized === 'failed' && !!_chunkedUploadAsyncAttachRetryContext;
-        retryButton.style.display = showRetry ? '' : 'none';
-        retryButton.disabled = _chunkedUploadAsyncAttachRetryInProgress;
-    }
-
-    if (normalized === 'queued') {
-        badge.style.background = '#e8f1ff';
-        badge.style.color = '#0f4c81';
-        badge.style.border = '1px solid #c6dcff';
-    } else if (normalized === 'running') {
-        badge.style.background = '#fff4d6';
-        badge.style.color = '#6b4a00';
-        badge.style.border = '1px solid #f2d08f';
-    } else if (normalized === 'succeeded') {
-        badge.style.background = '#e6f6ea';
-        badge.style.color = '#0f5132';
-        badge.style.border = '1px solid #b7e4c7';
-    } else if (normalized === 'failed') {
-        badge.style.background = '#fbeaea';
-        badge.style.color = '#7a1f1f';
-        badge.style.border = '1px solid #f1b5b5';
-    } else {
-        badge.style.background = '#eef0f2';
-        badge.style.color = '#2f3a46';
-        badge.style.border = '1px solid #d5dbe1';
-    }
-
-    persistAsyncAttachBadgeState(normalized, text);
-    syncAsyncAttachBadgeBottomOffset();
-
-    if (normalized === 'succeeded') {
-        _chunkedUploadAsyncBadgeAutoDismissTimer = setTimeout(function () {
-            updateAsyncAttachBadge(null, 'hidden');
-        }, CHUNKED_UPLOAD_ASYNC_BADGE_AUTO_DISMISS_MS);
     }
 }
 
@@ -2616,6 +2568,86 @@ function syncUploadWidgetProgressDom(koViewModel, percent) {
 
     if (cancelContainer) {
         cancelContainer.classList.add('hidden');
+    }
+}
+
+function hasChunkedUploadCommandPanelFiles() {
+    const vm = resolveAnyUploadKoViewModel();
+    if (vm && typeof vm.uploadedFiles === 'function') {
+        try {
+            const files = vm.uploadedFiles();
+            if (files && files.length > 0) {
+                return true;
+            }
+        } catch (e) {
+            // Ignore KO observable read errors and fallback to DOM check.
+        }
+    }
+
+    const uploadedItems = document.querySelectorAll('#idCreationRecCommandPanel .clsUploadedListItem');
+    return !!(uploadedItems && uploadedItems.length > 0);
+}
+
+function syncChunkedUploadCommandPanelInteractivityGuard() {
+    if (!hasChunkedUploadCommandPanelFiles()) {
+        if (_chunkedUploadCommandPanelObserver) {
+            try {
+                _chunkedUploadCommandPanelObserver.disconnect();
+            } catch (e) {
+                // Ignore observer disconnect issues.
+            }
+            _chunkedUploadCommandPanelObserver = null;
+        }
+        return;
+    }
+
+    ensureChunkedUploadCommandPanelInteractive(3);
+
+    if (_chunkedUploadCommandPanelObserver || typeof MutationObserver === 'undefined' || !document.body) {
+        return;
+    }
+
+    _chunkedUploadCommandPanelObserver = new MutationObserver(function () {
+        if (!hasChunkedUploadCommandPanelFiles()) {
+            if (_chunkedUploadCommandPanelObserver) {
+                try {
+                    _chunkedUploadCommandPanelObserver.disconnect();
+                } catch (e) {
+                    // Ignore observer disconnect issues.
+                }
+                _chunkedUploadCommandPanelObserver = null;
+            }
+            return;
+        }
+
+        ensureChunkedUploadCommandPanelInteractive(0);
+    });
+
+    _chunkedUploadCommandPanelObserver.observe(document.body, {
+        attributes: true,
+        childList: true,
+        subtree: true,
+        attributeFilter: ['class']
+    });
+}
+
+function ensureChunkedUploadCommandPanelInteractive(retryCount) {
+    const attempts = Number.isFinite(retryCount) ? retryCount : 0;
+    const root = window.root;
+
+    if (root && root.recordMainCreationPanel && typeof root.recordMainCreationPanel.disableUploaded === 'function') {
+        root.recordMainCreationPanel.disableUploaded(false);
+    }
+
+    const commandPanel = document.querySelector('#idCreationRecCommandPanel .clsRecCommandPanel');
+    if (commandPanel && commandPanel.classList && commandPanel.classList.contains('disabledAction')) {
+        commandPanel.classList.remove('disabledAction');
+    }
+
+    if (attempts > 0) {
+        setTimeout(function () {
+            ensureChunkedUploadCommandPanelInteractive(attempts - 1);
+        }, 140);
     }
 }
 
@@ -2686,8 +2718,35 @@ function applySuccessfulUploadState(koViewModel, file, uploadedFileName, fullUpl
         koViewModel.uploadProgress(100);
     }
 
+    // CM may re-apply disabledAction after uploadedFiles changes (e.g. record type selection).
+    // Keep panel interactive while uploaded files are present.
+    syncChunkedUploadCommandPanelInteractivityGuard();
+
     syncUploadWidgetProgressDom(koViewModel, 100);
     return true;
+}
+
+function applySuccessfulUploadStateWithRetry(file, uploadedFileName, fullUploadedFileName, options) {
+    const maxAttempts = 12;
+    const retryDelayMs = 150;
+    let attempts = 0;
+
+    function tryApply() {
+        attempts++;
+        const vm = resolveAnyUploadKoViewModel();
+        if (applySuccessfulUploadState(vm, file, uploadedFileName, fullUploadedFileName, options)) {
+            logDebug('Applied uploader success state after deferred KO VM resolution.');
+            return;
+        }
+
+        if (attempts < maxAttempts) {
+            setTimeout(tryApply, retryDelayMs);
+        } else {
+            logDebug('Could not resolve uploader KO VM after retries; keeping native form flow.');
+        }
+    }
+
+    setTimeout(tryApply, retryDelayMs);
 }
 
 const handleChunkedUploadDeleteClick = function (event) {
@@ -2712,6 +2771,64 @@ const handleChunkedUploadDeleteClick = function (event) {
     setPendingChunkedUploadDeleteConfirmation(originalFileNames);
 };
 
+function resetChunkedUploadWidgetAfterCancel(koViewModel, clearInputElement) {
+    const resolvedVm =
+        koViewModel ||
+        resolveUploadKoViewModel(clearInputElement) ||
+        resolveUploadKoViewModel(_chunkedUploadLastContextElement || document.activeElement || document.body) ||
+        resolveAnyUploadKoViewModel();
+
+    if (resolvedVm) {
+        try {
+            if (typeof resolvedVm.clearForm === 'function') {
+                resolvedVm.clearForm();
+            }
+        } catch (e) {
+            // Ignore clearForm failures and continue with explicit resets.
+        }
+
+        if (typeof resolvedVm.files === 'function') {
+            resolvedVm.files([]);
+        }
+
+        if (typeof resolvedVm.uploadingFiles === 'function') {
+            resolvedVm.uploadingFiles([]);
+        }
+
+        if (typeof resolvedVm.uploadedFiles === 'function') {
+            resolvedVm.uploadedFiles([]);
+        }
+
+        if (typeof resolvedVm.uploadProgress === 'function') {
+            resolvedVm.uploadProgress(0);
+        }
+
+        if (typeof resolvedVm.showUploadingPanel === 'function') {
+            resolvedVm.showUploadingPanel(false);
+        }
+
+        // The top-left Upload button in SimpleUpload is bound to enable: uploadSuccessStatus.
+        if (typeof resolvedVm.uploadSuccessStatus === 'function') {
+            resolvedVm.uploadSuccessStatus(true);
+        }
+
+        if (typeof resolvedVm.disableRemoveBtn === 'function') {
+            resolvedVm.disableRemoveBtn(false);
+        }
+
+        if (typeof resolvedVm.statusMessage === 'function') {
+            resolvedVm.statusMessage('');
+        }
+    }
+
+    if (clearInputElement && typeof clearInputElement.value !== 'undefined') {
+        clearInputElement.value = '';
+    }
+
+    ensureChunkedUploadCommandPanelInteractive(6);
+    syncChunkedUploadCommandPanelInteractivityGuard();
+}
+
 const handleChunkedUploadDeleteConfirmOkClick = function (event) {
     const okButton = event && event.target && event.target.closest
         ? event.target.closest('button#okBtn')
@@ -2719,7 +2836,6 @@ const handleChunkedUploadDeleteConfirmOkClick = function (event) {
 
     if (!okButton) return;
 
-    _chunkedUploadAsyncBadgeTransientSuppressed = false;
     updateAsyncAttachBadge(null, 'hidden');
 
     const originalFileNames = consumePendingChunkedUploadDeleteConfirmation();
@@ -2737,7 +2853,6 @@ const handleChunkedUploadDeleteConfirmCancelClick = function (event) {
 
     if (!cancelButton) return;
     clearPendingChunkedUploadDeleteConfirmation();
-    _chunkedUploadAsyncBadgeTransientSuppressed = false;
     updateAsyncAttachBadge(null, 'hidden');
 };
 
@@ -3212,6 +3327,18 @@ const handleChunkedUploadRecordCreateClick = function (event) {
     ensureChunkedUploadTitleBeforeSubmit(formElement);
 };
 
+const handleChunkedUploadRecordCreateCancelClick = function (event) {
+    const cancelButton = event && event.target && event.target.closest
+        ? event.target.closest('button[name="cancelBtn"], button[data-bind*="$parent.cancel"], button[data-bind*="cancel"]')
+        : null;
+
+    if (!cancelButton) return;
+    if (!cancelButton.closest('.clsNewCreateRecordPanel')) return;
+
+    updateAsyncAttachBadge(null, 'hidden');
+    clearChunkedUploadSuggestedTitle();
+};
+
 const handleChunkedUploadFormFieldChange = function (event) {
     if (!_chunkedUploadPendingSuggestedTitle) {
         return;
@@ -3488,6 +3615,9 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
     const effectiveContext = contextElement || _chunkedUploadLastContextElement || document.activeElement || document.body;
     rememberChunkedUploadContext(effectiveContext);
 
+    // Reset per-flow auto-refresh guard so every new create flow can trigger post-attach navigation.
+    _chunkedUploadAsyncAttachAutoRefreshScheduled = false;
+
     if (isChunkedUploadFileActive(file)) {
         logDebug('[ChunkedUpload] Skipping duplicate process invocation for active file:', file.name);
         return;
@@ -3496,7 +3626,6 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
     const activeFileKey = markChunkedUploadFileActive(file);
 
     // Starting a new upload should clear stale async attach status from prior flows.
-    _chunkedUploadAsyncBadgeTransientSuppressed = false;
     updateAsyncAttachBadge(null, 'hidden');
     hideChunkedUploadProgressMessageDom();
 
@@ -3563,7 +3692,10 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
         })) {
             logDebug('Injected staged path and visible success state into KO uploader. UploadedFileName:', uiUploadedFileName || '(deferred async attach)');
         } else {
-            logDebug('Could not find KO ViewModel for uploader context; upload may rely on native form state.');
+            logDebug('Could not find KO ViewModel for uploader context; retrying shortly.');
+            applySuccessfulUploadStateWithRetry(file, uiUploadedFileName, fullUploadedFileName, {
+                deferNativeAttach: isLargeFilePilotCandidate
+            });
         }
 
         hideChunkedUploadProgressMessageDom();
@@ -3578,6 +3710,7 @@ async function processChunkedUploadFile(file, contextElement, clearInputElement)
     } catch (error) {
         if (isChunkedUploadCancelled(error)) {
             logDebug('Chunked upload cancelled by user.');
+            resetChunkedUploadWidgetAfterCancel(koViewModel, clearInputElement);
             const text = getChunkedUploadOverlayText();
             window._chunkedUploadOverlay.update(0, text.uploadCancelled);
             setTimeout(function () { window._chunkedUploadOverlay.hide(); }, 700);
@@ -3731,6 +3864,7 @@ if (window.__chunkedUploadDeleteHandlerInstalled !== true) {
 
 if (window.__chunkedUploadRecordCreateClickHandlerInstalled !== true) {
     document.addEventListener('click', handleChunkedUploadRecordCreateClick, true);
+    document.addEventListener('click', handleChunkedUploadRecordCreateCancelClick, true);
     window.__chunkedUploadRecordCreateClickHandlerInstalled = true;
 }
 
@@ -3738,6 +3872,16 @@ if (window.__chunkedUploadFormFieldChangeHandlerInstalled !== true) {
     document.addEventListener('change', handleChunkedUploadFormFieldChange, true);
     window.__chunkedUploadFormFieldChangeHandlerInstalled = true;
 }
+
+(function applyChunkedUploadPendingPostAttachQueryOnLoad() {
+    if (window.__chunkedUploadPostAttachQueryApplied === true) {
+        return;
+    }
+    window.__chunkedUploadPostAttachQueryApplied = true;
+
+    // Drain any stale key from previous builds; current flow does not replay creator-query navigation.
+    consumeChunkedUploadPendingPostAttachUri();
+})();
 
 function resolveChunkedUploadBandwidthHints() {
     const networkHintMbps = readChunkedUploadNetworkUplinkMbps();
